@@ -23,4 +23,6 @@ g++ -O2 -s -static -municode -mwindows SingleStart-Lite.cpp app_res.o -o SingleS
 
 两个版本的单实例互斥体同名，**不要同时运行**。
 
-由 HelaRoro 和 DeepSeek V4 Flash 共同开发。
+## 关于
+
+由 **HelaRoro** 和 **DeepSeek V4 Flash** 共同开发。
