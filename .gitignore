@@ -1,0 +1,5 @@
+# 编译产物（源码仓库不提交二进制）
+SingleStart-Lite.exe
+
+# 运行时生成
+error_log.txt
