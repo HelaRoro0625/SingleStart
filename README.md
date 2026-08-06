@@ -1,6 +1,6 @@
 # SingleStart-Lite
 
-防重复启动托盘工具（轻量版）。
+防重复启动托盘工具（轻量版，Alpha）。
 
 与 [SingleStart](https://github.com/HelaRoro0625/SingleStart)（WinUI 3 版）**功能逻辑一致**：
 - 后台托盘常驻，拦截"短时间内的重复启动"
