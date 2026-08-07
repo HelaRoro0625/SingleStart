@@ -1,6 +1,6 @@
 # SingleStart
 
-防重复启动托盘工具（原生 Win32 版，Alpha）。
+防重复启动托盘工具（原生 Win32 版，v0.1.1）。
 
 **单文件可执行，无需安装 .NET**，体积约 300KB，兼容 Win10/Win11。后台托盘常驻，拦截"短时间内的重复启动"。
 
@@ -16,8 +16,8 @@
 依赖 MinGW（ucrt64）g++/windres：
 
 ```bash
-windres --no-preprocess -O coff app.rc -o app_res.o
-g++ -O2 -s -static -municode -mwindows SingleStart.cpp app_res.o -o SingleStart.exe
+windres -O coff app.rc -o app_res.o
+g++ -O2 -s -static -municode -mwindows SingleStart.cpp app_res.o -o SingleStart.exe -lcomctl32
 ```
 
 ## 注意

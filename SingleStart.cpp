@@ -17,6 +17,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <commctrl.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <cwctype>
@@ -612,8 +613,8 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         mkCtl(L"EDIT", L"", ES_AUTOHSCROLL, cw, 26, (HMENU)IDC_TITLE_EDIT);
         y += 26 + 4;
         mkCtl(L"STATIC", L"标题中的 {count} 会被替换为实际拦截次数，{app} 为最近被拦截的程序名。",
-              0, cw, 32, NULL);
-        y += 32 + 18;
+              0, cw, 44, NULL);
+        y += 44 + 12;
 
         // 通知内容自定义
         mkCtl(L"STATIC", L"通知内容自定义", 0, cw, 20, NULL);
@@ -623,7 +624,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         y += 90 + 4;
         mkCtl(L"STATIC", L"内容中的 {count}、{app} 同理；输入 \\n 表示换行。",
               0, cw, 32, NULL);
-        y += 32 + 18;
+        y += 32 + 12;
 
         // 白名单
         mkCtl(L"STATIC", L"白名单", 0, cw, 20, NULL);
@@ -644,24 +645,25 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
               0, cw, 40, NULL);
         y += 40 + 18;
 
-        // 按钮
+        // 按钮（每个独占一行，宽度一致）
         CreateWindowExW(0, L"BUTTON", L"保存设置", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                        x, y, 110, 30, page, (HMENU)IDC_SAVE_BTN, g_hInst, NULL);
-        CreateWindowExW(0, L"BUTTON", L"退出软件", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                        x + 120, y, 110, 30, page, (HMENU)IDC_EXIT_BTN, g_hInst, NULL);
+                        x, y, cw, 30, page, (HMENU)IDC_SAVE_BTN, g_hInst, NULL);
         SendMessageW(GetDlgItem(page, IDC_SAVE_BTN), WM_SETFONT, (WPARAM)f, TRUE);
+        y += 30 + 10;
+
+        CreateWindowExW(0, L"BUTTON", L"退出软件", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                        x, y, cw, 30, page, (HMENU)IDC_EXIT_BTN, g_hInst, NULL);
         SendMessageW(GetDlgItem(page, IDC_EXIT_BTN), WM_SETFONT, (WPARAM)f, TRUE);
-        y += 30 + 16;
+        y += 30 + 10;
 
-        // 状态提示
-        mkCtl(L"STATIC", L"", 0, cw, 20, (HMENU)IDC_STATUS);
-        y += 20 + 12;
-
-        // 还原默认设置
         CreateWindowExW(0, L"BUTTON", L"还原默认设置", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                         x, y, cw, 30, page, (HMENU)IDC_RESTORE_BTN, g_hInst, NULL);
         SendMessageW(GetDlgItem(page, IDC_RESTORE_BTN), WM_SETFONT, (WPARAM)f, TRUE);
-        y += 30 + 16;
+        y += 30 + 10;
+
+        // 状态提示
+        mkCtl(L"STATIC", L"", 0, cw, 20, (HMENU)IDC_STATUS);
+        y += 20 + 10;
 
         // 底部说明（最后一行）
         mkCtl(L"STATIC", L"由 HelaRoro 和 DeepSeek V4 Flash 共同开发", 0, cw, 20, NULL);
@@ -772,7 +774,7 @@ static void OpenSettings() {
     g_settingsWnd = CreateWindowExW(0, kSettingsClass, kSettingsTitle,
                                     WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
                                     WS_VSCROLL | WS_CLIPCHILDREN,
-                                    CW_USEDEFAULT, CW_USEDEFAULT, 410, 560,
+                                    CW_USEDEFAULT, CW_USEDEFAULT, 410, 660,
                                     NULL, NULL, g_hInst, NULL);
     if (g_settingsWnd) {
         ShowWindow(g_settingsWnd, SW_SHOW);
@@ -967,6 +969,10 @@ static DWORD WINAPI MonitorThread(LPVOID) {
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     g_hInst = hInst;
     SetProcessDPIAware();
+
+    // 启用 ComCtl32 v6 视觉样式（现代按钮/编辑框外观；需配合 app.manifest 声明 v6 依赖）
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES };
+    InitCommonControlsEx(&icc);
 
     // 守护者自身单实例
     HANDLE hMutex = CreateMutexW(NULL, TRUE, kMutexName);
