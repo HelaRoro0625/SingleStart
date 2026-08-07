@@ -1,4 +1,4 @@
-// SingleStart-Lite.cpp - 防重复启动工具（守护其他软件）
+// SingleStart.cpp - 防重复启动工具（守护其他软件）
 // 由 HelaRoro 和 DeepSeek V4 Flash 共同开发
 //
 // 功能：
@@ -12,7 +12,7 @@
 //  6. 开机自启、进程扫描间隔、白名单等设置保存在 HKCU 注册表。
 //  7. 启动出错时在程序所在目录写 error_log.txt（不可写则退回 %TEMP%），弹气泡后退出。
 //
-// 逻辑与 SingleStart-Alpha（WinUI 3 版）保持一致：2 秒重复窗口、可配置扫描间隔（默认 100ms，
+// 逻辑与 SingleStart-WinUI（WinUI 3 版）保持一致：2 秒重复窗口、可配置扫描间隔（默认 100ms，
 // 范围 20–2000）、还原默认设置、开机自启在保存时统一应用。注册表键位与 WinUI 版相同，设置可共享。
 
 #define WIN32_LEAN_AND_MEAN

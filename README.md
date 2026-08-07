@@ -1,14 +1,15 @@
-# SingleStart-Lite
+# SingleStart
 
-防重复启动托盘工具（轻量版，Alpha）。
+防重复启动托盘工具（原生 Win32 版，Alpha）。
 
-与 [SingleStart](https://github.com/HelaRoro0625/SingleStart)（WinUI 3 版）**功能逻辑一致**：
-- 后台托盘常驻，拦截"短时间内的重复启动"
+**单文件可执行，无需安装 .NET**，体积约 300KB，兼容 Win10/Win11。后台托盘常驻，拦截"短时间内的重复启动"。
+
+功能：
 - 通知标题/内容可自定义（支持 `{count}` / `{app}`）
 - 白名单、开机自启、进程扫描间隔（20–2000ms）可配置
 - 还原默认设置
 
-区别：**原生 Win32 界面**，单文件可执行，**无需安装 .NET**，体积约 300KB，兼容 Win10/Win11。
+> 本仓库为**当前主版本**。WinUI 3 重构版（`SingleStart-WinUI`，C#）已移至私有仓库，不再维护。
 
 ## 构建（可选）
 
@@ -16,7 +17,7 @@
 
 ```bash
 windres --no-preprocess -O coff app.rc -o app_res.o
-g++ -O2 -s -static -municode -mwindows SingleStart-Lite.cpp app_res.o -o SingleStart-Lite.exe
+g++ -O2 -s -static -municode -mwindows SingleStart.cpp app_res.o -o SingleStart.exe
 ```
 
 ## 注意
