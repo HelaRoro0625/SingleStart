@@ -1,11 +1,11 @@
-// app.rc - 资源文件
+﻿// app.rc - 资源文件
 // 由 HelaRoro 和 DeepSeek V4 Flash 共同开发
 1 ICON "app.ico"
 1 24 "app.manifest"
 
 1 VERSIONINFO
-FILEVERSION 0,1,1,0
-PRODUCTVERSION 0,1,1,0
+FILEVERSION 0,2,0,0
+PRODUCTVERSION 0,2,0,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -17,12 +17,12 @@ BEGIN
         BLOCK "080404b0"
         BEGIN
             VALUE "CompanyName", "HelaRoro"
-            VALUE "FileDescription", "SingleStart - 防重复启动托盘工具"
-            VALUE "FileVersion", "0.1.1.0"
+            VALUE "FileDescription", "SingleStart"
+            VALUE "FileVersion", "0.2.0.0"
             VALUE "InternalName", "SingleStart"
             VALUE "OriginalFilename", "SingleStart.exe"
             VALUE "ProductName", "SingleStart"
-            VALUE "ProductVersion", "0.1.1.0"
+            VALUE "ProductVersion", "0.2.0.0"
         END
     END
     BLOCK "VarFileInfo"
