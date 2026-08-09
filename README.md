@@ -10,7 +10,6 @@
 - 白名单（列表管理，右键或长按删除）、开机自启、进程扫描间隔（20–2000ms）可配置
 - 还原默认设置
 
-> 本仓库为**当前主版本**。WinUI 3 重构版（`SingleStart-WinUI`，C#）已移至私有仓库，不再维护。
 
 ## 更新日志
 
@@ -28,13 +27,10 @@ windres --codepage=65001 -O coff app.rc -o app_res.o
 g++ -O2 -s -static -municode -mwindows SingleStart.cpp app_res.o -o SingleStart.exe -lcomctl32 -lversion -lcomdlg32 -ldwmapi -lshell32
 ```
 
-## 注意
-
-两个版本的单实例互斥体同名，**不要同时运行**。
 
 ## 关于
 
-由 **HelaRoro** 和 **DeepSeek V4 Flash** 共同开发。
+由 **DeepSeek V4 Flash** 共同开发。
 
 ## 贡献者
 
