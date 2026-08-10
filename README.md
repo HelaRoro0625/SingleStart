@@ -20,11 +20,22 @@
 
 ## 构建（可选）
 
-依赖 MinGW（ucrt64）g++/windres：
+依赖 MSYS2 MinGW-w64 工具链。64 位用 `ucrt64`，32 位用 `mingw32`。32 位版本兼容 Win7–Win11；64 位版本在 Win7 上需安装 UCRT 更新（KB2999226）。
+
+### 64 位（ucrt64）
 
 ```bash
+export PATH="/c/msys64/ucrt64/bin:$PATH"
 windres --codepage=65001 -O coff app.rc -o app_res.o
 g++ -O2 -s -static -municode -mwindows SingleStart.cpp app_res.o -o SingleStart.exe -lcomctl32 -lversion -lcomdlg32 -ldwmapi -lshell32
+```
+
+### 32 位（mingw32，需先安装 `pacman -S mingw-w64-i686-gcc`）
+
+```bash
+export PATH="/c/msys64/mingw32/bin:$PATH"
+windres --codepage=65001 -O coff app.rc -o app_res32.o
+g++ -O2 -s -static -municode -mwindows SingleStart.cpp app_res32.o -o SingleStart-32.exe -lcomctl32 -lversion -lcomdlg32 -ldwmapi -lshell32
 ```
 
 
