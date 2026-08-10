@@ -2,7 +2,7 @@
 
 防重复启动托盘工具。
 
-**单文件可执行，无需安装 .NET**，体积约 300KB，兼容 Win10/Win11。后台托盘常驻，拦截"短时间内的重复启动"。
+**单文件可执行**，体积约 300KB，兼容 Win10/Win11。后台托盘常驻，拦截"短时间内的重复启动"。
 
 功能：
 - 通知标题/内容可自定义（支持 `{app}` 软件名）
@@ -30,10 +30,4 @@ g++ -O2 -s -static -municode -mwindows SingleStart.cpp app_res.o -o SingleStart.
 
 ## 关于
 
-由 **DeepSeek V4 Flash** 共同开发。
-
-## 贡献者
-
-- [HelaRoro](https://github.com/HelaRoro0625)
-- [claude](https://github.com/claude)
-- [deepseek](https://github.com/deepseek)
+由 **DeepSeek V4 Flash** 开发。
