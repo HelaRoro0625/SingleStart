@@ -9,7 +9,7 @@
 //     系统自带应用（计算器、记事本等）同样在拦截范围内。
 //  4. 通知标题/内容可自定义，支持 {app}（软件名称，取自 exe 版本信息的 FileDescription）。
 //  5. 托盘图标：左键单击打开设置；右键菜单可打开设置 / 退出。
-//  6. 开机自启、启动时通知、其他程序启动时提醒、进程扫描间隔、白名单等设置保存在 HKCU 注册表。
+//  6. 开机自启、启动时通知、其他程序启动时提醒、重复启动拦截开关、进程扫描间隔、白名单等设置保存在 HKCU 注册表。
 //  7. 其他程序启动时提醒：检测到软件启动时，在屏幕上方显示无按钮的圆角提醒，随后自动淡出。
 //  8. 启动出错时在程序所在目录写 error_log.txt（不可写则退回 %TEMP%），弹气泡后退出。
 //
@@ -41,7 +41,7 @@ static const wchar_t* kRunKey         = L"Software\\Microsoft\\Windows\\CurrentV
 static const wchar_t* kRunValueName   = L"SingleStart";
 static const wchar_t* kTrayTip        = L"SingleStart（防重复启动）";
 static const wchar_t* kDefaultTitle   = L"{app}正在启动，请稍候";
-static const wchar_t* kDefaultContent = L"不要重复打开软件！";
+static const wchar_t* kDefaultContent = L"无需再打开{app}！";
 
 static const DWORD kDefaultReminderTimeout = 5000; // 启动提醒默认显示时长（毫秒）
 static const DWORD kReminderTimeoutMin      = 500;
@@ -85,6 +85,7 @@ static const DWORD kPollIntervalMax = 2000;      // 可设置的上限：数值�
 #define IDC_REMINDER_TIMEOUT_EDIT 113 // 提醒显示时长（毫秒）
 #define IDC_WL_LIST          114 // 白名单列表（自绘 ListBox）
 #define IDC_WL_ADD           115 // 添加软件
+#define IDC_BLOCK_NOTIFY     116 // 其他程序重复启动拦截并通知
 
 // ---------------------------------------------------------------- 全局状态
 
@@ -111,7 +112,8 @@ struct Settings {
     std::vector<std::wstring> whitelist; // 白名单：程序文件名（小写）
     DWORD pollIntervalMs = kDefaultPollIntervalMs; // 进程扫描间隔（毫秒），监控线程每轮读取
     bool  startupNotify  = false;  // 启动时通知
-    bool  launchReminder = false;  // 其他程序启动时提醒
+    bool  launchReminder = true;   // 其他程序启动时提醒（默认开启）
+    bool  blockNotify    = true;   // 其他程序重复启动拦截并通知（默认开启）
     std::wstring reminderContent;  // 提醒内容模板（默认与通知标题一致）
     DWORD reminderTimeoutMs = kDefaultReminderTimeout; // 提醒显示时长（毫秒）
 };
@@ -382,7 +384,8 @@ static void LoadSettings() {
     if (p > kPollIntervalMax) p = kPollIntervalMax;
     g_settings.pollIntervalMs = p;
     g_settings.startupNotify     = RegGetDword(L"StartupNotify", 0) != 0;
-    g_settings.launchReminder    = RegGetDword(L"LaunchReminder", 0) != 0;
+    g_settings.launchReminder    = RegGetDword(L"LaunchReminder", 1) != 0; // 默认开启
+    g_settings.blockNotify       = RegGetDword(L"BlockNotify", 1) != 0;
     g_settings.reminderContent   = RegGetString(L"ReminderContent", L"");
     DWORD t = RegGetDword(L"ReminderTimeoutMs", kDefaultReminderTimeout);
     if (t < kReminderTimeoutMin) t = kReminderTimeoutMin;
@@ -640,6 +643,7 @@ static void SaveSettings() {
     // 故一律照读并保存，关闭->再开启时内容不会丢。
     bool startupNotify  = IsDlgButtonChecked(g_settingsPage, IDC_STARTUP_NOTIFY) == BST_CHECKED;
     bool launchReminder = IsDlgButtonChecked(g_settingsPage, IDC_LAUNCH_REMINDER) == BST_CHECKED;
+    bool blockNotify    = IsDlgButtonChecked(g_settingsPage, IDC_BLOCK_NOTIFY) == BST_CHECKED;
     std::wstring reminderContent;
     GetWindowTextW(GetDlgItem(g_settingsPage, IDC_REMINDER_EDIT), buf, 4095);
     reminderContent = buf;
@@ -655,6 +659,7 @@ static void SaveSettings() {
     g_settings.pollIntervalMs    = poll;
     g_settings.startupNotify     = startupNotify;
     g_settings.launchReminder    = launchReminder;
+    g_settings.blockNotify       = blockNotify;
     g_settings.reminderContent   = reminderContent;
     g_settings.reminderTimeoutMs = reminderTimeout;
     LeaveCriticalSection(&g_settingsLock);
@@ -665,6 +670,7 @@ static void SaveSettings() {
     RegSetDword(L"PollIntervalMs", poll);
     RegSetDword(L"StartupNotify", startupNotify ? 1 : 0);
     RegSetDword(L"LaunchReminder", launchReminder ? 1 : 0);
+    RegSetDword(L"BlockNotify", blockNotify ? 1 : 0);
     RegSetString(L"ReminderContent", reminderContent.c_str());
     RegSetDword(L"ReminderTimeoutMs", reminderTimeout);
 
@@ -686,7 +692,8 @@ static void RestoreDefaults(HWND hwnd) {
     g_settings.whitelist.clear();
     g_settings.pollIntervalMs    = kDefaultPollIntervalMs;
     g_settings.startupNotify     = false;
-    g_settings.launchReminder    = false;
+    g_settings.launchReminder    = true;   // 提醒功能默认开启
+    g_settings.blockNotify       = true;   // 拦截通知默认开启
     g_settings.reminderContent.clear();
     g_settings.reminderTimeoutMs = kDefaultReminderTimeout;
     LeaveCriticalSection(&g_settingsLock);
@@ -696,7 +703,8 @@ static void RestoreDefaults(HWND hwnd) {
     RegSetMultiString(L"Whitelist", std::vector<std::wstring>());
     RegSetDword(L"PollIntervalMs", kDefaultPollIntervalMs);
     RegSetDword(L"StartupNotify", 0);
-    RegSetDword(L"LaunchReminder", 0);
+    RegSetDword(L"LaunchReminder", 1);
+    RegSetDword(L"BlockNotify", 1);
     RegSetString(L"ReminderContent", L"");
     RegSetDword(L"ReminderTimeoutMs", kDefaultReminderTimeout);
     ApplyAutoStart(false);
@@ -711,8 +719,11 @@ static void RestoreDefaults(HWND hwnd) {
     CheckDlgButton(g_settingsPage, IDC_AUTOSTART, BST_UNCHECKED);
     CheckDlgButton(g_settingsPage, IDC_STARTUP_NOTIFY, BST_UNCHECKED);
     CheckDlgButton(g_settingsPage, IDC_LAUNCH_REMINDER, BST_UNCHECKED);
+    CheckDlgButton(g_settingsPage, IDC_BLOCK_NOTIFY, BST_CHECKED); // 拦截通知默认开启
     EnableWindow(GetDlgItem(g_settingsPage, IDC_REMINDER_EDIT), FALSE);
     EnableWindow(GetDlgItem(g_settingsPage, IDC_REMINDER_TIMEOUT_EDIT), FALSE);
+    EnableWindow(GetDlgItem(g_settingsPage, IDC_TITLE_EDIT), TRUE);
+    EnableWindow(GetDlgItem(g_settingsPage, IDC_CONTENT_EDIT), TRUE);
     SetStatus(L"已还原默认设置");
 }
 
@@ -768,6 +779,11 @@ static LRESULT CALLBACK PageProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
+        // 设置窗口图标（标题栏 + 任务栏）
+        if (g_icon) {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)g_icon);
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)g_icon);
+        }
         g_settingsPage = CreateWindowExW(0, kPageClass, L"",
                                          WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
                                          0, 0, 0, 0, hwnd, NULL, g_hInst, NULL);
@@ -792,46 +808,39 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 
         // 开机自动启动
         mkCtl(L"BUTTON", L"开机自动启动", BS_AUTOCHECKBOX, cw, 24, (HMENU)IDC_AUTOSTART);
-        y += 24 + 12;
-
-        // 启动时通知（开机自启下面）
-        mkCtl(L"BUTTON", L"启动时通知", BS_AUTOCHECKBOX, cw, 24, (HMENU)IDC_STARTUP_NOTIFY);
         y += 24 + 10;
-        mkCtl(L"STATIC", L"启动后弹出气泡提示“SingleStart 已启动”。", 0, cw, 32, NULL);
-        y += 32 + 12;
+
+        // 启动时通知
+        mkCtl(L"BUTTON", L"本软件启动时通知", BS_AUTOCHECKBOX, cw, 24, (HMENU)IDC_STARTUP_NOTIFY);
+        y += 24 + 10;
 
         // 其他程序启动时提醒
-        mkCtl(L"BUTTON", L"其他程序启动时提醒", BS_AUTOCHECKBOX, cw, 24, (HMENU)IDC_LAUNCH_REMINDER);
+        mkCtl(L"BUTTON", L"其他软件启动时提醒", BS_AUTOCHECKBOX, cw, 24, (HMENU)IDC_LAUNCH_REMINDER);
         y += 24 + 10;
-        mkCtl(L"STATIC", L"检测到任何软件启动时，屏幕上方显示提醒并自动淡出。",
-              0, cw, 32, NULL);
-        y += 32 + 12;
 
         // 提醒内容（仅开启时可编辑）
         mkCtl(L"STATIC", L"提醒内容", 0, cw, 20, NULL);
         y += 20 + 4;
         mkCtl(L"EDIT", L"", ES_AUTOHSCROLL, cw, 26, (HMENU)IDC_REMINDER_EDIT);
         y += 26 + 4;
-        mkCtl(L"STATIC", L"{app} 会被替换为软件名称，\\n 表示换行。默认同通知标题，开启提醒后才可编辑。",
-              0, cw, 44, NULL);
-        y += 44 + 12;
+        mkCtl(L"STATIC", L"{app} 会被替换为软件名称，\\n 表示换行。", 0, cw, 32, NULL);
+        y += 32 + 12;
 
         // 提醒显示时长
-        mkCtl(L"STATIC", L"提醒显示时长", 0, cw, 20, NULL);
+        mkCtl(L"STATIC", L"提醒显示时长（毫秒）", 0, cw, 20, NULL);
         y += 20 + 4;
         mkCtl(L"EDIT", L"", ES_AUTOHSCROLL | ES_NUMBER, cw, 26, (HMENU)IDC_REMINDER_TIMEOUT_EDIT);
-        y += 26 + 4;
-        mkCtl(L"STATIC", L"软件打开或超时后渐变消失，默认 5000ms。仅开启时可编辑。",
-              0, cw, 40, NULL);
-        y += 40 + 12;
+        y += 26 + 10;
+
+        // 其他程序重复启动拦截并通知（默认开启，控制下方标题/内容编辑）
+        mkCtl(L"BUTTON", L"其他程序重复启动拦截并通知", BS_AUTOCHECKBOX, cw, 24, (HMENU)IDC_BLOCK_NOTIFY);
+        y += 24 + 10;
 
         // 通知标题
         mkCtl(L"STATIC", L"通知标题", 0, cw, 20, NULL);
         y += 20 + 4;
         mkCtl(L"EDIT", L"", ES_AUTOHSCROLL, cw, 26, (HMENU)IDC_TITLE_EDIT);
-        y += 26 + 4;
-        mkCtl(L"STATIC", L"支持 {app} 软件名。", 0, cw, 32, NULL);
-        y += 32 + 12;
+        y += 26 + 10;
 
         // 通知内容
         mkCtl(L"STATIC", L"通知内容", 0, cw, 20, NULL);
@@ -854,17 +863,14 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                         x, y, cw, 30, page, (HMENU)IDC_WL_ADD, g_hInst, NULL);
         SendMessageW(GetDlgItem(page, IDC_WL_ADD), WM_SETFONT, (WPARAM)f, TRUE);
         y += 30 + 6;
-        mkCtl(L"STATIC", L"列表内的程序不会拦截也不会提醒，右键或长按删除。", 0, cw, 32, NULL);
+        mkCtl(L"STATIC", L"列表内的程序不会拦截或提醒，右键或长按删除。", 0, cw, 32, NULL);
         y += 32 + 12;
 
         // 进程扫描间隔
-        mkCtl(L"STATIC", L"进程扫描间隔", 0, cw, 20, NULL);
+        mkCtl(L"STATIC", L"进程扫描间隔（毫秒）", 0, cw, 20, NULL);
         y += 20 + 4;
         mkCtl(L"EDIT", L"100", ES_AUTOHSCROLL | ES_NUMBER, cw, 26, (HMENU)IDC_POLL_EDIT);
-        y += 26 + 4;
-        mkCtl(L"STATIC", L"越小越灵敏但更耗 CPU，默认 100ms。",
-              0, cw, 40, NULL);
-        y += 40 + 18;
+        y += 26 + 18;
 
         // 按钮（每个独占一行，宽度一致）
         CreateWindowExW(0, L"BUTTON", L"保存设置", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
@@ -895,6 +901,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         CheckDlgButton(page, IDC_AUTOSTART, IsAutoStartEnabled() ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(page, IDC_STARTUP_NOTIFY, g_settings.startupNotify ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(page, IDC_LAUNCH_REMINDER, g_settings.launchReminder ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(page, IDC_BLOCK_NOTIFY, g_settings.blockNotify ? BST_CHECKED : BST_UNCHECKED);
         SetWindowTextW(GetDlgItem(page, IDC_REMINDER_EDIT), g_settings.reminderContent.c_str());
         SetDlgItemInt(page, IDC_REMINDER_TIMEOUT_EDIT, (int)g_settings.reminderTimeoutMs, FALSE);
         SetWindowTextW(GetDlgItem(page, IDC_TITLE_EDIT), g_settings.titleFormat.c_str());
@@ -907,6 +914,8 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         bool remindOn = g_settings.launchReminder;
         EnableWindow(GetDlgItem(page, IDC_REMINDER_EDIT), remindOn);
         EnableWindow(GetDlgItem(page, IDC_REMINDER_TIMEOUT_EDIT), remindOn);
+        EnableWindow(GetDlgItem(page, IDC_TITLE_EDIT), g_settings.blockNotify); // 仅拦截开启时可编辑标题/内容
+        EnableWindow(GetDlgItem(page, IDC_CONTENT_EDIT), g_settings.blockNotify);
         ApplyScroll(hwnd);
         return 0;
     }
@@ -1020,6 +1029,13 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                         SetWindowTextW(GetDlgItem(g_settingsPage, IDC_REMINDER_EDIT), tbuf);
                     }
                 }
+            }
+            break;
+        case IDC_BLOCK_NOTIFY:
+            if (HIWORD(wp) == BN_CLICKED) {
+                bool on = IsDlgButtonChecked(g_settingsPage, IDC_BLOCK_NOTIFY) == BST_CHECKED;
+                EnableWindow(GetDlgItem(g_settingsPage, IDC_TITLE_EDIT), on);
+                EnableWindow(GetDlgItem(g_settingsPage, IDC_CONTENT_EDIT), on);
             }
             break;
         case IDC_WL_ADD: {
@@ -1253,13 +1269,22 @@ static LRESULT CALLBACK ReminderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         HDC mdc = CreateCompatibleDC(hdc);
         HBITMAP bmp = CreateCompatibleBitmap(hdc, kOverlayW, kOverlayH);
         HBITMAP oldBmp = (HBITMAP)SelectObject(mdc, bmp);
+        // 先填满整个窗口（避免 layered 窗口未绘制区域露出黑色），再沿圆角路径描边：
+        // 路径几何与窗口圆角区域一致，四角描边完整，也不会产生黑色边缘
         RECT rc = { 0, 0, kOverlayW, kOverlayH };
         HBRUSH bg = CreateSolidBrush(RGB(255, 251, 225)); // 浅黄底
         FillRect(mdc, &rc, bg);
         DeleteObject(bg);
-        HBRUSH border = CreateSolidBrush(RGB(210, 170, 70));
-        FrameRect(mdc, &rc, border);
-        DeleteObject(border);
+        HPEN pen = CreatePen(PS_SOLID, 1, RGB(210, 170, 70));
+        HPEN oldPn = (HPEN)SelectObject(mdc, pen);
+        HBRUSH oldBr = (HBRUSH)SelectObject(mdc, GetStockObject(NULL_BRUSH)); // 仅描边不填充
+        BeginPath(mdc);
+        RoundRect(mdc, 1, 1, kOverlayW - 1, kOverlayH - 1, 16, 16);
+        EndPath(mdc);
+        StrokePath(mdc);
+        SelectObject(mdc, oldPn);
+        SelectObject(mdc, oldBr);
+        DeleteObject(pen);
         SetBkMode(mdc, TRANSPARENT);
         SetTextColor(mdc, RGB(60, 60, 60));
         HFONT oldFont = (HFONT)SelectObject(mdc,
@@ -1502,6 +1527,9 @@ static DWORD WINAPI MonitorThread(LPVOID) {
         Sleep(GetPollIntervalMs());
         ULONGLONG now = GetTickCount64();
         auto cur = EnumProcs();
+        EnterCriticalSection(&g_settingsLock);
+        bool blockNotify = g_settings.blockNotify; // 重复启动拦截开关（false 时不拦截、不通知）
+        LeaveCriticalSection(&g_settingsLock);
 
         for (auto& kv : cur) {
             DWORD pid = kv.first;
@@ -1552,7 +1580,7 @@ static DWORD WINAPI MonitorThread(LPVOID) {
                 for (auto& k2 : cur) {
                     if (k2.first != pid && Lower(k2.second.exe) == key) { survivor = true; break; }
                 }
-                if (survivor) {
+                if (survivor && blockNotify) {
                     // 判定为连点造成的重复启动：结束新进程
                     HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
                     BOOL killed = FALSE;
