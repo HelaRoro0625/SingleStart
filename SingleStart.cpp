@@ -11,7 +11,13 @@
 //  5. 托盘图标：左键单击打开设置；右键菜单可打开设置 / 退出。
 //  6. 开机自启、启动时通知、其他程序启动时提醒、重复启动拦截开关、进程扫描间隔、白名单等设置保存在 HKCU 注册表。
 //  7. 其他程序启动时提醒：检测到软件启动时，在屏幕上方显示无按钮的圆角提醒，随后自动淡出。
-//  8. 启动出错时在程序所在目录写 error_log.txt（不可写则退回 %TEMP%），弹气泡后退出。
+//     弹出时同时播放"快速渐显 + 上滑回弹"动画（点击位置在屏幕顶部时改为下滑），
+//     整条提醒是自绘的抗锯齿卡片，并跟随系统深浅色。
+//  8. 可选（设置里开关，需先开启"其他软件启动时提醒"，默认关闭）：目标软件窗口真正显示后，
+//     提醒移动到该窗口的位置、放大到窗口大小覆盖其上，然后渐隐消失。
+//  9. 设置界面与提醒卡片都跟随系统明暗自动切换；提醒卡片为较不透明的半透明卡片，
+//     圆角/描边全部走逐像素 alpha 抗锯齿（不使用系统模糊材质，原因见 ReminderColors 注释）。
+// 10. 启动出错时在程序所在目录写 error_log.txt（不可写则退回 %TEMP%），弹气泡后退出。
 //
 // 逻辑与 SingleStart-WinUI（WinUI 3 版）保持一致：2 秒重复窗口、可配置扫描间隔（默认 100ms，
 // 范围 20–2000）、还原默认设置、开机自启在保存时统一应用。注册表键位与 WinUI 版相同，设置可共享。
@@ -23,11 +29,21 @@
 #include <tlhelp32.h>
 #include <commdlg.h>   // GetOpenFileNameW（白名单"添加软件"）
 #include <winver.h>    // GetFileVersionInfo 系列（读取软件名 FileDescription）
-#include <dwmapi.h>    // DWMWA_CLOAKED（覆盖层主窗口检测）
+#include <dwmapi.h>    // DWMWA_CLOAKED（覆盖层主窗口检测）/ 系统背景材质
+#include <uxtheme.h>   // SetWindowTheme（设置界面深色模式）
+#include <objidl.h>    // GDI+ 需要 IStream
+#include <gdiplus.h>   // 覆盖层抗锯齿绘制（圆角、文字、图标）
+#include <mmsystem.h>  // timeBeginPeriod：动画期间提高定时器精度，否则 16ms 定时器实际约 31ms
+#include <cmath>
 #include <cwctype>
 #include <map>
 #include <string>
 #include <vector>
+
+#ifdef _MSC_VER
+#pragma comment(lib, "gdiplus")
+#pragma comment(lib, "uxtheme")
+#endif
 
 // ---------------------------------------------------------------- 常量
 
@@ -51,6 +67,23 @@ static const int   kOverlayW  = 360;
 static const int   kOverlayH  = 48;
 static const wchar_t* kReminderClass = L"SingleStart_ReminderClass";
 
+// 覆盖层动画参数（时间单位毫秒，位移单位逻辑像素）
+static const int kRemTimerMs     = 16;  // 有动画时的时钟周期（≈60fps），动画才顺滑
+static const int kRemIdleTickMs  = 100; // 没有动画（稳定/等待）时的时钟周期：省电，不必 60fps 空转
+static const int kRemPollMs      = 160; // 稳定阶段轮询目标窗口的间隔（按时间算，与时钟周期无关）
+static const int kRemWaitPollMs  = 500; // 隐形等待阶段的轮询间隔
+static const int kRemExeScanMs   = 1000;// 等待阶段"按 exe 名找窗口"的频率（要遍历进程，降频调用）
+static const int kPopMs          = 260; // 弹出位移时长
+static const int kPopFadeMs      = 120; // 弹出期间的渐显时长（比渐隐快）
+static const int kPopOffset      = 20;  // 弹出起点与终点的位移距离
+static const int kPopBack        = 145; // 回弹强度（百分比，145≈7% 过冲，越大回弹越明显）
+static const int kFadeMs         = 480; // 渐隐时长（超时/目标进程退出，与原版速度接近）
+static const int kCoverMs        = 380; // 移动到目标窗口并放大的时长
+static const int kCoverFadeMs    = 260; // 覆盖到位后的渐隐时长
+static const int kCoverStepTicks = 1;   // 覆盖动画每帧都出（配合下方的快速绘制，跑满 60fps）
+static const int kCoverWaitMs    = 20000; // 提醒超时消失后，仍继续等目标窗口出现的时长
+static const int kCoverIconGrow  = 350;   // 视觉引导动画末尾图标放大到百分之多少（350 = 3.5 倍）
+
 // ---------------------------------------------------------------- 高分屏 / 大缩放
 // 软件按“系统 DPI 感知”运行（app.manifest 声明 dpiAware=true，wWinMain 里 SetProcessDPIAware）。
 // 字体取系统消息字体（SystemParametersInfo 返回的 lfMessageFont 已按系统 DPI 缩放），
@@ -62,7 +95,10 @@ static int Sx(int v) { return (int)(v * g_dpiScale + 0.5); }
 static int OverlayW() { return Sx(kOverlayW); }
 static int OverlayH() { return Sx(kOverlayH); }
 
-static const DWORD kDupWindowMs    = 2000;   // 判定"连点重复启动"的时间窗口（毫秒），与 WinUI 版一致（原 10 秒改为 2 秒）
+// 判定"连点重复启动"的时间窗口（毫秒）：可在设置里调整，默认 2 秒（与 WinUI 版一致）
+static const DWORD kDefaultDupWindowMs = 2000;
+static const DWORD kDupWindowMin       = 500;
+static const DWORD kDupWindowMax       = 10000;
 static const DWORD kDefaultPollIntervalMs = 100; // 进程扫描间隔默认值（毫秒），可在设置里调整
 static const DWORD kPollIntervalMin = 20;        // 可设置的下限：数值越小越灵敏，但更耗 CPU
 static const DWORD kPollIntervalMax = 2000;      // 可设置的上限：数值越大越省 CPU，但可能漏掉短命存根
@@ -73,9 +109,8 @@ static const DWORD kPollIntervalMax = 2000;      // 可设置的上限：数值�
 #define WM_BLOCKED    (WM_APP + 2)  // 监控线程：拦截到一次重复启动
 #define WM_REMINDER   (WM_APP + 3)  // 监控线程：检测到软件启动（无论是否拦截），显示覆盖层提醒
 #define WM_SHOW_STARTUP (WM_APP + 4) // 启动时通知
-#define IDT_DEBOUNCE  1
 #define IDT_STARTUP   3
-#define IDT_REMINDER  4
+#define IDT_THEME     5
 
 #define IDM_SETTINGS  500
 #define IDM_EXIT      501
@@ -98,6 +133,16 @@ static const DWORD kPollIntervalMax = 2000;      // 可设置的上限：数值�
 #define IDC_WL_ADD           115 // 添加软件
 #define IDC_BLOCK_DUP        116 // 拦截重复启动（连点只保留第一个窗口）
 #define IDC_BLOCK_NOTIFY     117 // 拦截到重复启动时气泡通知
+#define IDC_COVER_WINDOW     118 // 视觉引导动画：提醒移动到目标软件窗口并覆盖（依赖"其他软件启动时提醒"）
+#define IDC_DUP_WINDOW_EDIT  119 // 重复启动判定时间（毫秒）
+// 分组标题（纯文字 STATIC，用正常文字色，与灰色说明文字区分开）；区间用于 WM_CTLCOLORSTATIC 判断
+#define IDC_SEC_FIRST        130
+#define IDC_SEC_STARTUP      130 // 启动与通知
+#define IDC_SEC_REMINDER     131 // 启动提醒弹窗
+#define IDC_SEC_BLOCK        132 // 重复启动拦截
+#define IDC_SEC_WHITELIST    133 // 白名单
+#define IDC_SEC_OTHER        134 // 其他
+#define IDC_SEC_LAST         134
 
 // ---------------------------------------------------------------- 全局状态
 
@@ -108,7 +153,7 @@ static HWND      g_settingsPage  = NULL;
 static HICON     g_icon          = NULL;
 static bool      g_trayAdded     = false;
 static UINT      g_msgTaskbarCreated = 0; // 资源管理器重启通知（TaskbarCreated 广播）
-static UINT      g_debounceTimer = 0;
+static ULONGLONG g_lastBlockBalloonTick = 0; // 上一次"拦截气泡"的时间：同一波连点只弹一条通知
 static const GUID kIconGuid =
     { 0x7a2f5b3c, 0x1e4d, 0x4f6a, { 0x9b, 0x8c, 0x3d, 0x2e, 0x1f, 0x0a, 0x5b, 0x6c } };
 
@@ -117,6 +162,13 @@ static int       g_scrollPos     = 0;
 static HFONT     g_font          = NULL;
 static std::wstring g_ownExeLower;
 static std::wstring g_lastErrorLogPath;
+
+// 设置页控件登记表：按这张表统一排版（表内顺序 = 页面上到下）
+static const int kPageCtlW = 280; // 页面控件的逻辑宽度（输入框/列表/按钮统一宽度）
+static const int kPageIndent = 12; // 分组内选项相对分组标题的缩进
+struct PageItem { HWND hwnd; int indent; int h; int gapAfter; };
+static std::vector<PageItem> g_pageItems;
+static void LayoutPage(HWND host);
 
 struct Settings {
     std::wstring titleFormat;
@@ -127,6 +179,8 @@ struct Settings {
     bool  launchReminder = true;   // 其他程序启动时提醒（默认开启）
     bool  blockDup       = true;   // 拦截重复启动（连点只保留第一个窗口，默认开启）
     bool  blockNotify    = true;   // 拦截到重复启动时气泡通知（默认开启）
+    bool  coverWindow    = false;  // 目标软件窗口出现后，提醒移动到该窗口并覆盖（默认关闭）
+    DWORD dupWindowMs = kDefaultDupWindowMs; // 重复启动判定时间（毫秒），监控线程每轮读取
     std::wstring reminderContent;  // 提醒内容模板（默认与通知标题一致）
     DWORD reminderTimeoutMs = kDefaultReminderTimeout; // 提醒显示时长（毫秒）
 };
@@ -140,9 +194,6 @@ struct LaunchEvent {
     std::wstring exe;  // 快照里的文件名（兜底用）
 };
 
-// 最近一次被拦截程序的显示名（主线程专用；WM_BLOCKED 去抖期间被覆盖更新，无需加锁）
-static std::wstring g_pendingBlockApp;
-
 // 低层鼠标钩子：记录最近一次左键点击的屏幕坐标。
 // 注：触控在 Win10/11 上不保证注入鼠标消息，故此处只是"点击位置"的首选来源，
 // 拿不到时覆盖层会改按目标程序主窗口定位（见 ShowReminder / ReminderTimerTick）。
@@ -150,6 +201,161 @@ static HHOOK g_mouseHook = NULL;
 static POINT g_lastClick = { -1, -1 };
 static ULONGLONG g_lastClickTick = 0;
 static bool g_hasClick = false;
+
+// ---------------------------------------------------------------- 深色模式（跟随系统）
+// 系统"应用模式"开关保存在 HKCU\...\Themes\Personalize\AppsUseLightTheme（0=深色，1=浅色）。
+// 设置界面靠 uxtheme 的深色主题把标准控件一起变暗（该接口未文档化，按序号动态取，
+// 老系统取不到就整体保持浅色，功能不受影响）；覆盖层提醒是自绘的，任何系统都能跟随深色。
+
+typedef BOOL (WINAPI *PFN_AllowDarkModeForWindow)(HWND, BOOL);
+typedef int  (WINAPI *PFN_SetPreferredAppMode)(int);
+typedef void (WINAPI *PFN_FlushMenuThemes)(void);
+
+static bool  g_sysDark     = false; // 系统当前是否为深色
+static bool  g_darkUiReady = false; // 设置界面深色是否可用（uxtheme 深色接口 + Win10 1809+）
+static DWORD g_winBuild    = 0;     // 系统内部版本号（判断亚克力/云母等接口是否可用）
+static PFN_AllowDarkModeForWindow g_pAllowDarkModeForWindow = NULL;
+static PFN_SetPreferredAppMode    g_pSetPreferredAppMode    = NULL;
+static PFN_FlushMenuThemes        g_pFlushMenuThemes        = NULL;
+
+// 设置界面配色（浅色 / 深色两套；g_uiDarkBuilt 记录画刷是按哪套建的）
+struct UiTheme {
+    COLORREF pageBg, text, subText, fieldBg, fieldText, selBg, selText, sep;
+    HBRUSH   brPage, brField, brSel, brSep;
+};
+static UiTheme g_ui;
+static bool    g_uiBuilt     = false;
+static bool    g_uiDarkBuilt = false;
+
+static void ApplySettingsTheme(HWND hwnd);
+static void RefreshReminderTheme();
+
+// GetVersionEx 会被兼容性清单改写，这里改用 ntdll!RtlGetVersion 取真实版本号
+static DWORD GetWindowsBuild() {
+    // 布局必须与 RTL_OSVERSIONINFOW 完全一致：5 个 ULONG 之后紧跟 128 个 WCHAR。
+    // （多插字段会让 RtlGetVersion 写入的字符串错位；这里只读 build，但别留下这个坑。）
+    struct Osvi {
+        ULONG size, major, minor, build, platform;
+        wchar_t csd[128];
+    };
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    if (nt) {
+        typedef LONG (WINAPI *PFN_RtlGetVersion)(void*);
+        PFN_RtlGetVersion f = (PFN_RtlGetVersion)GetProcAddress(nt, "RtlGetVersion");
+        if (f) {
+            Osvi v;
+            ZeroMemory(&v, sizeof(v));
+            v.size = sizeof(v);
+            if (f(&v) == 0 && v.build) return v.build;
+        }
+    }
+    return 0;
+}
+
+static bool SystemUsesDarkTheme() {
+    HKEY k = NULL;
+    DWORD v = 1, sz = sizeof(v), type = 0;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                      0, KEY_READ, &k) == ERROR_SUCCESS) {
+        if (RegQueryValueExW(k, L"AppsUseLightTheme", NULL, &type, (BYTE*)&v, &sz) != ERROR_SUCCESS ||
+            type != REG_DWORD)
+            v = 1; // 读不到按浅色处理
+        RegCloseKey(k);
+    }
+    return v == 0;
+}
+
+static void InitDarkModeSupport() {
+    if (!g_winBuild) g_winBuild = GetWindowsBuild();
+    HMODULE ux = LoadLibraryW(L"uxtheme.dll");
+    if (ux) {
+        g_pAllowDarkModeForWindow = (PFN_AllowDarkModeForWindow)GetProcAddress(ux, MAKEINTRESOURCEA(133));
+        g_pSetPreferredAppMode    = (PFN_SetPreferredAppMode)GetProcAddress(ux, MAKEINTRESOURCEA(135));
+        g_pFlushMenuThemes        = (PFN_FlushMenuThemes)GetProcAddress(ux, MAKEINTRESOURCEA(136));
+    }
+    g_darkUiReady = (g_winBuild >= 17763) && g_pAllowDarkModeForWindow && g_pSetPreferredAppMode;
+    if (g_darkUiReady) g_pSetPreferredAppMode(1); // PreferredAppMode::AllowDark
+    g_sysDark = SystemUsesDarkTheme();
+}
+
+// 按当前明暗重建配色画刷（明暗没变就直接返回）
+static void BuildUiTheme() {
+    bool dark = g_sysDark && g_darkUiReady;
+    if (g_uiBuilt && dark == g_uiDarkBuilt) return;
+    if (g_ui.brPage)  { DeleteObject(g_ui.brPage);  g_ui.brPage  = NULL; }
+    if (g_ui.brField) { DeleteObject(g_ui.brField); g_ui.brField = NULL; }
+    if (g_ui.brSel)   { DeleteObject(g_ui.brSel);   g_ui.brSel   = NULL; }
+    if (g_ui.brSep)   { DeleteObject(g_ui.brSep);   g_ui.brSep   = NULL; }
+    if (dark) {
+        g_ui.pageBg    = RGB(32, 32, 32);
+        g_ui.text      = RGB(240, 240, 240);
+        g_ui.subText   = RGB(155, 155, 155);
+        g_ui.fieldBg   = RGB(45, 45, 45);
+        g_ui.fieldText = RGB(238, 238, 238);
+        g_ui.selBg     = RGB(38, 79, 120);
+        g_ui.selText   = RGB(255, 255, 255);
+        g_ui.sep       = RGB(72, 72, 72);
+    } else {
+        g_ui.pageBg    = GetSysColor(COLOR_BTNFACE);
+        g_ui.text      = GetSysColor(COLOR_WINDOWTEXT);
+        g_ui.subText   = GetSysColor(COLOR_GRAYTEXT);
+        g_ui.fieldBg   = GetSysColor(COLOR_WINDOW);
+        g_ui.fieldText = GetSysColor(COLOR_WINDOWTEXT);
+        g_ui.selBg     = GetSysColor(COLOR_HIGHLIGHT);
+        g_ui.selText   = GetSysColor(COLOR_HIGHLIGHTTEXT);
+        g_ui.sep       = RGB(214, 214, 214);
+    }
+    g_ui.brPage  = CreateSolidBrush(g_ui.pageBg);
+    g_ui.brField = CreateSolidBrush(g_ui.fieldBg);
+    g_ui.brSel   = CreateSolidBrush(g_ui.selBg);
+    g_ui.brSep   = CreateSolidBrush(g_ui.sep);
+    g_uiDarkBuilt = dark;
+    g_uiBuilt = true;
+}
+
+static BOOL CALLBACK ThemeChildCB(HWND child, LPARAM lp) {
+    bool dark = lp != 0;
+    if (g_pAllowDarkModeForWindow) g_pAllowDarkModeForWindow(child, dark ? TRUE : FALSE);
+    SetWindowTheme(child, dark ? L"DarkMode_Explorer" : NULL, NULL);
+    return TRUE;
+}
+
+// 给窗口及其全部子控件套用/撤销深色主题（EnumChildWindows 会递归到所有后代）
+static void ApplyWindowDarkTheme(HWND top, bool dark) {
+    if (!top || !g_darkUiReady) return;
+    if (g_pAllowDarkModeForWindow) g_pAllowDarkModeForWindow(top, dark ? TRUE : FALSE);
+    SetWindowTheme(top, dark ? L"DarkMode_Explorer" : NULL, NULL);
+    EnumChildWindows(top, ThemeChildCB, dark ? 1 : 0);
+}
+
+// 标题栏深色（Win10 1809+ 用属性 20，更早的预览版用 19）
+static void ApplyTitleBarTheme(HWND hwnd, bool dark) {
+    if (!hwnd || g_winBuild < 17763) return;
+    BOOL v = dark ? TRUE : FALSE;
+    if (FAILED(DwmSetWindowAttribute(hwnd, 20, &v, sizeof(v))))
+        DwmSetWindowAttribute(hwnd, 19, &v, sizeof(v));
+}
+
+// 系统明暗可能变化时调用（WM_SETTINGCHANGE / 定时兜底）：真的变了才重刷
+static void OnSystemThemeMaybeChanged() {
+    bool dark = SystemUsesDarkTheme();
+    if (dark == g_sysDark) return;
+    g_sysDark = dark;
+    if (g_settingsWnd) ApplySettingsTheme(g_settingsWnd);
+    RefreshReminderTheme();
+}
+
+// 套用设置窗口主题（配色 + 控件主题 + 标题栏）并重画
+static void ApplySettingsTheme(HWND hwnd) {
+    if (!hwnd) return;
+    BuildUiTheme();
+    bool dark = g_sysDark && g_darkUiReady;
+    ApplyWindowDarkTheme(hwnd, dark);
+    ApplyTitleBarTheme(hwnd, dark);
+    if (dark && g_pFlushMenuThemes) g_pFlushMenuThemes();
+    RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
 
 // ---------------------------------------------------------------- 工具函数
 
@@ -508,6 +714,12 @@ static void LoadSettings() {
     DWORD oldBlock = RegGetDword(L"BlockNotify", 1);
     g_settings.blockNotify       = oldBlock != 0;
     g_settings.blockDup          = RegGetDword(L"BlockDup", oldBlock) != 0;
+    // 目标窗口覆盖：新功能，默认关闭
+    g_settings.coverWindow       = RegGetDword(L"CoverWindow", 0) != 0;
+    DWORD dw = RegGetDword(L"DupWindowMs", kDefaultDupWindowMs);
+    if (dw < kDupWindowMin) dw = kDupWindowMin;
+    if (dw > kDupWindowMax) dw = kDupWindowMax;
+    g_settings.dupWindowMs = dw;
     // 提醒内容与通知标题是两个独立字段：默认值取 kDefaultTitle。
     // （旧行为是“留空则跟随通知标题”，但改动即自动保存会把标题固化进本字段，
     //   之后改标题不再影响提醒文案，反而不易理解，故改为独立默认值。）
@@ -529,6 +741,16 @@ static DWORD GetPollIntervalMs() {
     if (p < kPollIntervalMin) p = kPollIntervalMin;
     if (p > kPollIntervalMax) p = kPollIntervalMax;
     return p;
+}
+
+// 当前"重复启动判定时间"（毫秒）：监控线程每轮读取，设置改动即时生效
+static DWORD GetDupWindowMs() {
+    EnterCriticalSection(&g_settingsLock);
+    DWORD v = g_settings.dupWindowMs;
+    LeaveCriticalSection(&g_settingsLock);
+    if (v < kDupWindowMin) v = kDupWindowMin;
+    if (v > kDupWindowMax) v = kDupWindowMax;
+    return v;
 }
 
 // 通知标题/内容模板（托盘线程弹通知时读取；与 WinUI 版 SettingsManager.Formats() 对应）
@@ -699,7 +921,7 @@ static void RegisterPageClass() {
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = PageProc; // 页面窗口必须用 PageProc：把控件消息转发给设置窗口并处理底色
     wc.hInstance = g_hInst;
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hbrBackground = NULL; // 底色由 PageProc 的 WM_ERASEBKGND 按当前明暗填充（深色模式需要）
     wc.lpszClassName = kPageClass;
     RegisterClassExW(&wc);
 }
@@ -781,6 +1003,17 @@ static void SaveSettings() {
     bool launchReminder = IsDlgButtonChecked(g_settingsPage, IDC_LAUNCH_REMINDER) == BST_CHECKED;
     bool blockDup       = IsDlgButtonChecked(g_settingsPage, IDC_BLOCK_DUP) == BST_CHECKED;
     bool blockNotify    = IsDlgButtonChecked(g_settingsPage, IDC_BLOCK_NOTIFY) == BST_CHECKED;
+    // 覆盖开关被禁用（没开提醒）时也照读照存，重新开启提醒后不会丢
+    bool coverWindow    = IsDlgButtonChecked(g_settingsPage, IDC_COVER_WINDOW) == BST_CHECKED;
+    // 重复启动判定时间：读输入框并夹到合法范围（夹取后写回界面，避免显示值与生效值不一致）
+    BOOL okDup = FALSE;
+    DWORD dupWindow = GetDlgItemInt(g_settingsPage, IDC_DUP_WINDOW_EDIT, &okDup, FALSE);
+    if (!okDup) dupWindow = kDefaultDupWindowMs;
+    DWORD dupWindowRaw = dupWindow;
+    if (dupWindow < kDupWindowMin) dupWindow = kDupWindowMin;
+    if (dupWindow > kDupWindowMax) dupWindow = kDupWindowMax;
+    if (okDup && dupWindow != dupWindowRaw)
+        SetDlgItemInt(g_settingsPage, IDC_DUP_WINDOW_EDIT, (int)dupWindow, FALSE);
     std::wstring reminderContent;
     GetWindowTextW(GetDlgItem(g_settingsPage, IDC_REMINDER_EDIT), buf, 4095);
     reminderContent = buf;
@@ -801,6 +1034,8 @@ static void SaveSettings() {
     g_settings.launchReminder    = launchReminder;
     g_settings.blockDup          = blockDup;
     g_settings.blockNotify       = blockNotify;
+    g_settings.coverWindow       = coverWindow;
+    g_settings.dupWindowMs       = dupWindow;
     g_settings.reminderContent   = reminderContent;
     g_settings.reminderTimeoutMs = reminderTimeout;
     LeaveCriticalSection(&g_settingsLock);
@@ -813,6 +1048,8 @@ static void SaveSettings() {
     RegSetDword(L"LaunchReminder", launchReminder ? 1 : 0);
     RegSetDword(L"BlockDup", blockDup ? 1 : 0);
     RegSetDword(L"BlockNotify", blockNotify ? 1 : 0);
+    RegSetDword(L"CoverWindow", coverWindow ? 1 : 0);
+    RegSetDword(L"DupWindowMs", dupWindow);
     RegSetString(L"ReminderContent", reminderContent.c_str());
     RegSetDword(L"ReminderTimeoutMs", reminderTimeout);
 
@@ -840,6 +1077,8 @@ static void RestoreDefaults(HWND hwnd) {
     g_settings.launchReminder    = true;   // 提醒功能默认开启
     g_settings.blockDup          = true;   // 拦截重复启动默认开启
     g_settings.blockNotify       = true;   // 拦截到重复启动时气泡通知默认开启
+    g_settings.coverWindow       = false;  // 覆盖目标窗口是新功能，默认关闭
+    g_settings.dupWindowMs       = kDefaultDupWindowMs;
     g_settings.reminderContent   = kDefaultTitle; // 提醒内容有自己的默认值，不跟随通知标题
     g_settings.reminderTimeoutMs = kDefaultReminderTimeout;
     LeaveCriticalSection(&g_settingsLock);
@@ -852,6 +1091,8 @@ static void RestoreDefaults(HWND hwnd) {
     RegSetDword(L"LaunchReminder", 1);
     RegSetDword(L"BlockDup", 1);
     RegSetDword(L"BlockNotify", 1);
+    RegSetDword(L"CoverWindow", 0);
+    RegSetDword(L"DupWindowMs", kDefaultDupWindowMs);
     RegSetString(L"ReminderContent", kDefaultTitle);
     RegSetDword(L"ReminderTimeoutMs", kDefaultReminderTimeout);
     ApplyAutoStart(false);
@@ -861,6 +1102,7 @@ static void RestoreDefaults(HWND hwnd) {
     SetWindowTextW(GetDlgItem(g_settingsPage, IDC_CONTENT_EDIT), kDefaultContent);
     SendMessageW(GetDlgItem(g_settingsPage, IDC_WL_LIST), LB_RESETCONTENT, 0, 0);
     SetDlgItemInt(g_settingsPage, IDC_POLL_EDIT, kDefaultPollIntervalMs, FALSE);
+    SetDlgItemInt(g_settingsPage, IDC_DUP_WINDOW_EDIT, kDefaultDupWindowMs, FALSE);
     SetWindowTextW(GetDlgItem(g_settingsPage, IDC_REMINDER_EDIT), kDefaultTitle);
     SetDlgItemInt(g_settingsPage, IDC_REMINDER_TIMEOUT_EDIT, kDefaultReminderTimeout, FALSE);
     CheckDlgButton(g_settingsPage, IDC_AUTOSTART, BST_UNCHECKED);
@@ -868,9 +1110,12 @@ static void RestoreDefaults(HWND hwnd) {
     CheckDlgButton(g_settingsPage, IDC_LAUNCH_REMINDER, BST_CHECKED); // 启动提醒默认开启
     CheckDlgButton(g_settingsPage, IDC_BLOCK_DUP, BST_CHECKED); // 拦截重复启动默认开启
     CheckDlgButton(g_settingsPage, IDC_BLOCK_NOTIFY, BST_CHECKED); // 拦截到重复启动时气泡通知默认开启
+    CheckDlgButton(g_settingsPage, IDC_COVER_WINDOW, BST_UNCHECKED); // 覆盖目标窗口默认关闭
     EnableWindow(GetDlgItem(g_settingsPage, IDC_REMINDER_EDIT), TRUE);
     EnableWindow(GetDlgItem(g_settingsPage, IDC_REMINDER_TIMEOUT_EDIT), TRUE);
+    EnableWindow(GetDlgItem(g_settingsPage, IDC_COVER_WINDOW), TRUE); // 提醒默认开启，故覆盖开关可用
     EnableWindow(GetDlgItem(g_settingsPage, IDC_BLOCK_NOTIFY), TRUE); // 拦截与气泡通知默认均开启
+    EnableWindow(GetDlgItem(g_settingsPage, IDC_DUP_WINDOW_EDIT), TRUE); // 拦截默认开启，故判定时间可编辑
     EnableWindow(GetDlgItem(g_settingsPage, IDC_TITLE_EDIT), TRUE);
     EnableWindow(GetDlgItem(g_settingsPage, IDC_CONTENT_EDIT), TRUE);
 
@@ -903,6 +1148,24 @@ static void ApplyScroll(HWND hwnd) {
     }
 }
 
+// 按登记表把页面控件从上到下摆一遍（分组内选项按 indent 缩进）
+static void LayoutPage(HWND host) {
+    if (!g_settingsPage) return;
+    const int M = Sx(14);
+    int y = Sx(8);
+    for (size_t i = 0; i < g_pageItems.size(); ++i) {
+        const PageItem& it = g_pageItems[i];
+        if (!it.hwnd) continue;
+        int x = M + Sx(it.indent);
+        int w = Sx(kPageCtlW) - Sx(it.indent);
+        ShowWindow(it.hwnd, SW_SHOWNA);
+        SetWindowPos(it.hwnd, NULL, x, y, w, Sx(it.h), SWP_NOZORDER | SWP_NOACTIVATE);
+        y += Sx(it.h) + Sx(it.gapAfter);
+    }
+    g_contentHeight = y;
+    if (host) ApplyScroll(host);
+}
+
 // 页面窗口：把控件的 WM_COMMAND / WM_NOTIFY 转发给设置窗口，并处理静态文字底色
 static LRESULT CALLBACK PageProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -916,13 +1179,35 @@ static LRESULT CALLBACK PageProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MEASUREITEM:
         // 必须返回设置窗口的处理结果（尤其 WM_MEASUREITEM 需返回 TRUE 才能让行高生效）
         return SendMessageW(GetParent(hwnd), msg, wp, lp);
+    case WM_ERASEBKGND: { // 类背景画刷为 NULL，底色由这里按当前明暗填充
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect((HDC)wp, &rc, g_ui.brPage);
+        return 1;
+    }
     case WM_CTLCOLORSTATIC: {
         // 静态标签（字段标题 / 提示等）文字用灰色，
-        // 背景与页面底色一致，避免文字以系统默认色（纯白）绘制而显得突兀
+        // 背景与页面底色一致，避免文字以系统默认色绘制而显得突兀；
+        // 分组标题用正常文字色，才像"标题"而不是提示。
         HDC hdc = (HDC)wp;
-        SetTextColor(hdc, GetSysColor(COLOR_GRAYTEXT));
-        SetBkColor(hdc, GetSysColor(COLOR_BTNFACE));
-        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        int id = ((HWND)lp != NULL) ? GetDlgCtrlID((HWND)lp) : 0;
+        bool isHeader = (id >= IDC_SEC_FIRST && id <= IDC_SEC_LAST);
+        SetTextColor(hdc, isHeader ? g_ui.text : g_ui.subText);
+        SetBkColor(hdc, g_ui.pageBg);
+        return (LRESULT)g_ui.brPage;
+    }
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX: {
+        // 输入框 / 列表底色：深色时跟着变暗（不依赖系统控件的深色主题）
+        HDC hdc = (HDC)wp;
+        SetTextColor(hdc, g_ui.fieldText);
+        SetBkColor(hdc, g_ui.fieldBg);
+        return (LRESULT)g_ui.brField;
+    }
+    case WM_CTLCOLORBTN: {
+        HDC hdc = (HDC)wp;
+        SetBkColor(hdc, g_ui.pageBg);
+        return (LRESULT)g_ui.brPage;
     }
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -940,13 +1225,10 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                                          WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
                                          0, 0, 0, 0, hwnd, NULL, g_hInst, NULL);
         HWND page = g_settingsPage;
-        const int M = Sx(14);
-        // 逻辑像素宽度，实际像素由 mkCtl 里的 Sx() 统一按系统缩放换算。
-        // 注意不要再写成 Sx(280)：mkCtl 已经换算过，重复换算会得到 缩放² 的宽度，
+        // 逻辑像素宽度，实际像素由布局时统一按系统缩放换算。
+        // 注意不要再写成 Sx(280)：布局里已经换算过，重复换算会得到 缩放² 的宽度，
         // 高分屏（125%/150%/200%）下控件会宽出窗口被截断。
         // 所有控件统一这个宽度（输入框、白名单列表、按钮都一样宽）。
-        const int cw = 280;
-        int x = M, y = Sx(8);
 
         NONCLIENTMETRICSW ncm;
         ncm.cbSize = sizeof(ncm);
@@ -954,99 +1236,95 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         g_font = CreateFontIndirectW(&ncm.lfMessageFont);
         HFONT f = g_font;
 
+        // 控件一律先建在 (0,0)，位置交给 LayoutPage 统一排版：
+        // 整页按"分组标题 + 分割线 + 缩进的选项"分成若干组，indent 是缩进（0 或 kPageIndent），
+        // gapAfter 是它与下一个控件之间的逻辑间距。
+        g_pageItems.clear();
         auto mkCtl = [&](const wchar_t* cls, const wchar_t* text, DWORD style,
-                         int w, int h, HMENU id) -> HWND {
+                         int h, HMENU id, int indent, int gapAfter) -> HWND {
             HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style,
-                                     x, y, Sx(w), Sx(h), page, id, g_hInst, NULL);
+                                     0, 0, Sx(kPageCtlW), Sx(h), page, id, g_hInst, NULL);
             SendMessageW(c, WM_SETFONT, (WPARAM)f, TRUE);
+            PageItem it;
+            it.hwnd = c;
+            it.indent = indent;
+            it.h = h;
+            it.gapAfter = gapAfter;
+            g_pageItems.push_back(it);
             return c;
         };
+        auto secTitle = [&](const wchar_t* text, HMENU id) { // 分组标题（正常文字色）
+            mkCtl(L"STATIC", text, 0, 22, id, 0, 2);
+        };
+        auto secLine = [&]() {                              // 分组分割线（自绘）
+            mkCtl(L"STATIC", L"", SS_OWNERDRAW, 10, NULL, 0, 10);
+        };
 
-        // 开机自动启动
-        mkCtl(L"BUTTON", L"开机自动启动", BS_AUTOCHECKBOX, cw, 24, (HMENU)IDC_AUTOSTART);
-        y += Sx(24) + Sx(10);
+        // ---- 基本
+        secTitle(L"基本", (HMENU)IDC_SEC_STARTUP);
+        secLine();
+        mkCtl(L"BUTTON", L"开机自动启动", BS_AUTOCHECKBOX, 24, (HMENU)IDC_AUTOSTART, kPageIndent, 10);
+        mkCtl(L"BUTTON", L"本软件启动时通知", BS_AUTOCHECKBOX, 24, (HMENU)IDC_STARTUP_NOTIFY, kPageIndent, 18);
 
-        // 启动时通知
-        mkCtl(L"BUTTON", L"本软件启动时通知", BS_AUTOCHECKBOX, cw, 24, (HMENU)IDC_STARTUP_NOTIFY);
-        y += Sx(24) + Sx(10);
-
-        // 其他程序启动时提醒
-        mkCtl(L"BUTTON", L"其他软件启动时提醒", BS_AUTOCHECKBOX, cw, 24, (HMENU)IDC_LAUNCH_REMINDER);
-        y += Sx(24) + Sx(10);
-
-        // 提醒内容（仅开启时可编辑）
-        mkCtl(L"STATIC", L"提醒内容", 0, cw, 20, NULL);
-        y += Sx(20) + Sx(4);
-        mkCtl(L"EDIT", L"", ES_AUTOHSCROLL, cw, 26, (HMENU)IDC_REMINDER_EDIT);
-        y += Sx(26) + Sx(4);
-        mkCtl(L"STATIC", L"{app} 会被替换为软件名称，\\n 表示换行。", 0, cw, 32, NULL);
-        y += Sx(32) + Sx(12);
-
-        // 提醒显示时长
-        mkCtl(L"STATIC", L"提醒显示时长（毫秒）", 0, cw, 20, NULL);
-        y += Sx(20) + Sx(4);
-        mkCtl(L"EDIT", L"", ES_AUTOHSCROLL | ES_NUMBER, cw, 26, (HMENU)IDC_REMINDER_TIMEOUT_EDIT);
-        y += Sx(26) + Sx(10);
-
+        // ---- 拦截（放在提醒之前）
+        secTitle(L"拦截", (HMENU)IDC_SEC_BLOCK);
+        secLine();
         // 拦截重复启动 与 拦截后气泡通知：两个独立开关（默认均开启）
-        mkCtl(L"BUTTON", L"拦截重复启动", BS_AUTOCHECKBOX, cw, 24, (HMENU)IDC_BLOCK_DUP);
-        y += Sx(24) + Sx(10);
+        mkCtl(L"BUTTON", L"拦截重复启动", BS_AUTOCHECKBOX, 24, (HMENU)IDC_BLOCK_DUP, kPageIndent, 10);
         // 气泡通知控制下方标题/内容的可编辑性
-        mkCtl(L"BUTTON", L"拦截到重复启动时气泡通知", BS_AUTOCHECKBOX, cw, 24, (HMENU)IDC_BLOCK_NOTIFY);
-        y += Sx(24) + Sx(10);
-
+        mkCtl(L"BUTTON", L"拦截到重复启动时气泡通知", BS_AUTOCHECKBOX, 24, (HMENU)IDC_BLOCK_NOTIFY, kPageIndent, 10);
+        // 重复启动判定时间（在这个时间窗口内再次启动才算重复；仅在开启拦截时可用）
+        mkCtl(L"STATIC", L"重复启动判定时间（毫秒）", 0, 20, NULL, kPageIndent, 4);
+        mkCtl(L"EDIT", L"2000", ES_AUTOHSCROLL | ES_NUMBER, 26, (HMENU)IDC_DUP_WINDOW_EDIT, kPageIndent, 10);
         // 通知标题
-        mkCtl(L"STATIC", L"通知标题", 0, cw, 20, NULL);
-        y += Sx(20) + Sx(4);
-        mkCtl(L"EDIT", L"", ES_AUTOHSCROLL, cw, 26, (HMENU)IDC_TITLE_EDIT);
-        y += Sx(26) + Sx(10);
-
+        mkCtl(L"STATIC", L"通知标题", 0, 20, NULL, kPageIndent, 4);
+        mkCtl(L"EDIT", L"", ES_AUTOHSCROLL, 26, (HMENU)IDC_TITLE_EDIT, kPageIndent, 10);
         // 通知内容
-        mkCtl(L"STATIC", L"通知内容", 0, cw, 20, NULL);
-        y += Sx(20) + Sx(4);
+        mkCtl(L"STATIC", L"通知内容", 0, 20, NULL, kPageIndent, 4);
         mkCtl(L"EDIT", L"", ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_WANTRETURN,
-              cw, 90, (HMENU)IDC_CONTENT_EDIT);
-        y += Sx(90) + Sx(4);
-        mkCtl(L"STATIC", L"支持 {app}，\\n 表示换行。", 0, cw, 32, NULL);
-        y += Sx(32) + Sx(12);
+              90, (HMENU)IDC_CONTENT_EDIT, kPageIndent, 4);
+        mkCtl(L"STATIC", L"支持 {app}，\\n 表示换行。", 0, 32, NULL, kPageIndent, 18);
 
-        // 白名单（列表形式，自带滚动条，独立于页面滚动）
-        mkCtl(L"STATIC", L"白名单", 0, cw, 20, NULL);
-        y += Sx(20) + Sx(4);
+        // ---- 提醒
+        secTitle(L"提醒", (HMENU)IDC_SEC_REMINDER);
+        secLine();
+        // 其他程序启动时提醒
+        mkCtl(L"BUTTON", L"其他软件启动时提醒", BS_AUTOCHECKBOX, 24, (HMENU)IDC_LAUNCH_REMINDER, kPageIndent, 10);
+        // 提醒内容（仅开启时可编辑）
+        mkCtl(L"STATIC", L"提醒内容", 0, 20, NULL, kPageIndent, 4);
+        mkCtl(L"EDIT", L"", ES_AUTOHSCROLL, 26, (HMENU)IDC_REMINDER_EDIT, kPageIndent, 4);
+        mkCtl(L"STATIC", L"{app} 会被替换为软件名称，\\n 表示换行。", 0, 32, NULL, kPageIndent, 12);
+        // 提醒显示时长
+        mkCtl(L"STATIC", L"提醒显示时长（毫秒）", 0, 20, NULL, kPageIndent, 4);
+        mkCtl(L"EDIT", L"", ES_AUTOHSCROLL | ES_NUMBER, 26, (HMENU)IDC_REMINDER_TIMEOUT_EDIT, kPageIndent, 10);
+        // 视觉引导动画（依赖"其他软件启动时提醒"，未开启时置灰不可选）
+        mkCtl(L"BUTTON", L"视觉引导动画", BS_AUTOCHECKBOX, 24, (HMENU)IDC_COVER_WINDOW, kPageIndent, 18);
+
+        // ---- 白名单（列表形式，自带滚动条，独立于页面滚动）
+        secTitle(L"白名单", (HMENU)IDC_SEC_WHITELIST);
+        secLine();
         // LBS_HASSTRINGS 必须加：owner-draw 列表没有它，LB_ADDSTRING 存的是被截断的 item data
         // 而非字符串，会导致列表项乱码且 LB_GETTEXT 读不回来（保存白名单时丢数据）
         mkCtl(L"LISTBOX", L"", LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_BORDER | LBS_NOTIFY,
-              cw, 150, (HMENU)IDC_WL_LIST);
-        y += Sx(150) + Sx(4);
+              150, (HMENU)IDC_WL_LIST, kPageIndent, 4);
         // 与列表同宽，保持整个白名单区块左对齐、右端齐平
-        CreateWindowExW(0, L"BUTTON", L"添加软件…", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                        x, y, Sx(cw), Sx(30), page, (HMENU)IDC_WL_ADD, g_hInst, NULL);
-        SendMessageW(GetDlgItem(page, IDC_WL_ADD), WM_SETFONT, (WPARAM)f, TRUE);
-        y += Sx(30) + Sx(6);
-        mkCtl(L"STATIC", L"列表内的程序不会拦截或提醒，右键或长按删除。", 0, cw, 32, NULL);
-        y += Sx(32) + Sx(12);
+        mkCtl(L"BUTTON", L"添加软件…", BS_PUSHBUTTON, 30, (HMENU)IDC_WL_ADD, kPageIndent, 6);
+        mkCtl(L"STATIC", L"列表内的程序不会拦截或提醒，右键或长按删除。", 0, 32, NULL, kPageIndent, 18);
 
+        // ---- 高级
+        secTitle(L"高级", (HMENU)IDC_SEC_OTHER);
+        secLine();
         // 进程扫描间隔
-        mkCtl(L"STATIC", L"进程扫描间隔（毫秒）", 0, cw, 20, NULL);
-        y += Sx(20) + Sx(4);
-        mkCtl(L"EDIT", L"100", ES_AUTOHSCROLL | ES_NUMBER, cw, 26, (HMENU)IDC_POLL_EDIT);
-        y += Sx(26) + Sx(18);
-
+        mkCtl(L"STATIC", L"进程扫描间隔（毫秒）", 0, 20, NULL, kPageIndent, 4);
+        mkCtl(L"EDIT", L"100", ES_AUTOHSCROLL | ES_NUMBER, 26, (HMENU)IDC_POLL_EDIT, kPageIndent, 18);
         // 按钮（每个独占一行，与输入框/列表同宽）。没有“保存”按钮：关闭设置窗口时保存。
-        CreateWindowExW(0, L"BUTTON", L"退出软件", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                        x, y, Sx(cw), Sx(30), page, (HMENU)IDC_EXIT_BTN, g_hInst, NULL);
-        SendMessageW(GetDlgItem(page, IDC_EXIT_BTN), WM_SETFONT, (WPARAM)f, TRUE);
-        y += Sx(30) + Sx(10);
-
-        CreateWindowExW(0, L"BUTTON", L"还原默认设置", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                        x, y, Sx(cw), Sx(30), page, (HMENU)IDC_RESTORE_BTN, g_hInst, NULL);
-        SendMessageW(GetDlgItem(page, IDC_RESTORE_BTN), WM_SETFONT, (WPARAM)f, TRUE);
-        y += Sx(30) + Sx(10);
+        mkCtl(L"BUTTON", L"退出软件", BS_PUSHBUTTON, 30, (HMENU)IDC_EXIT_BTN, kPageIndent, 10);
+        mkCtl(L"BUTTON", L"还原默认设置", BS_PUSHBUTTON, 30, (HMENU)IDC_RESTORE_BTN, kPageIndent, 20);
 
         // 状态提示（最后一行）
-        mkCtl(L"STATIC", L"", 0, cw, 20, (HMENU)IDC_STATUS);
-        y += Sx(20) + Sx(8);
-        g_contentHeight = y;
+        mkCtl(L"STATIC", L"", 0, 20, (HMENU)IDC_STATUS, 0, 8);
+
+        LayoutPage(hwnd);
 
         // 载入当前设置
         CheckDlgButton(page, IDC_AUTOSTART, IsAutoStartEnabled() ? BST_CHECKED : BST_UNCHECKED);
@@ -1054,6 +1332,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         CheckDlgButton(page, IDC_LAUNCH_REMINDER, g_settings.launchReminder ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(page, IDC_BLOCK_DUP, g_settings.blockDup ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(page, IDC_BLOCK_NOTIFY, g_settings.blockNotify ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(page, IDC_COVER_WINDOW, g_settings.coverWindow ? BST_CHECKED : BST_UNCHECKED);
         SetWindowTextW(GetDlgItem(page, IDC_REMINDER_EDIT), EffectiveReminderContent().c_str());
         SetDlgItemInt(page, IDC_REMINDER_TIMEOUT_EDIT, (int)g_settings.reminderTimeoutMs, FALSE);
         SetWindowTextW(GetDlgItem(page, IDC_TITLE_EDIT), g_settings.titleFormat.c_str());
@@ -1062,17 +1341,47 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         for (auto& w : g_settings.whitelist)
             SendMessageW(GetDlgItem(page, IDC_WL_LIST), LB_ADDSTRING, 0, (LPARAM)w.c_str());
         SetDlgItemInt(page, IDC_POLL_EDIT, (int)g_settings.pollIntervalMs, FALSE);
-        // 提醒内容/时长仅在"其他程序启动时提醒"开启时可编辑
+        SetDlgItemInt(page, IDC_DUP_WINDOW_EDIT, (int)g_settings.dupWindowMs, FALSE);
+        // 提醒内容/时长仅在"其他程序启动时提醒"开启时可编辑；覆盖开关同样依赖它
         bool remindOn = g_settings.launchReminder;
         EnableWindow(GetDlgItem(page, IDC_REMINDER_EDIT), remindOn);
         EnableWindow(GetDlgItem(page, IDC_REMINDER_TIMEOUT_EDIT), remindOn);
-        // 拦截关闭时，“拦截气泡通知”选项及标题/内容一并禁用
+        EnableWindow(GetDlgItem(page, IDC_COVER_WINDOW), remindOn);
+        // 拦截关闭时，"拦截气泡通知"选项、判定时间及标题/内容一并禁用
         EnableWindow(GetDlgItem(page, IDC_BLOCK_NOTIFY), g_settings.blockDup);
+        EnableWindow(GetDlgItem(page, IDC_DUP_WINDOW_EDIT), g_settings.blockDup);
         EnableWindow(GetDlgItem(page, IDC_TITLE_EDIT), g_settings.blockDup && g_settings.blockNotify);
         EnableWindow(GetDlgItem(page, IDC_CONTENT_EDIT), g_settings.blockDup && g_settings.blockNotify);
-        ApplyScroll(hwnd);
+        // 跟随系统明暗（深色时把标准控件一起换成深色主题）
+        SetTimer(hwnd, IDT_THEME, 1000, NULL); // 兜底轮询：系统切换明暗时 WM_SETTINGCHANGE 偶尔收不到
+        ApplySettingsTheme(hwnd);
         return 0;
     }
+
+    case WM_ERASEBKGND: { // 客户区被页面子窗口盖住，这里只兜底避免拉伸时露白
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect((HDC)wp, &rc, g_ui.brPage);
+        return 1;
+    }
+
+    case WM_SETTINGCHANGE:
+        // 系统切换浅色/深色时会广播 WM_SETTINGCHANGE，lParam 为 "ImmersiveColorSet"
+        if (lp && !IsBadStringPtrW((LPCWSTR)lp, 64) &&
+            _wcsicmp((const wchar_t*)lp, L"ImmersiveColorSet") == 0)
+            OnSystemThemeMaybeChanged();
+        return 0;
+
+    case WM_THEMECHANGED:
+        OnSystemThemeMaybeChanged();
+        return 0;
+
+    case WM_TIMER:
+        if (wp == IDT_THEME) {
+            OnSystemThemeMaybeChanged();
+            return 0;
+        }
+        break;
 
     case WM_SIZE:
         if (g_settingsPage) ApplyScroll(hwnd);
@@ -1138,15 +1447,25 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 
     case WM_DRAWITEM: {
         LPDRAWITEMSTRUCT dis = (LPDRAWITEMSTRUCT)lp;
+        if (dis->CtlType == ODT_STATIC) {
+            // 分组分割线：先铺页面底色（避免滚动时留下残影），再在竖直中线画一条 1px 细线
+            RECT rc = dis->rcItem;
+            FillRect(dis->hDC, &rc, g_ui.brPage);
+            int y = rc.top + (rc.bottom - rc.top) / 2;
+            RECT line = { rc.left, y, rc.right, y + 1 };
+            FillRect(dis->hDC, &line, g_ui.brSep);
+            return TRUE;
+        }
         if (dis->CtlType != ODT_LISTBOX) break;
         HDC hdc = dis->hDC;
         RECT rc = dis->rcItem;
         if (dis->itemState & ODS_SELECTED) {
-            FillRect(hdc, &rc, (HBRUSH)(COLOR_HIGHLIGHT + 1));
-            SetTextColor(hdc, GetSysColor(COLOR_HIGHLIGHTTEXT));
+            FillRect(hdc, &rc, g_ui.brPage); // 先铺底，避免选中行两侧留白
+            FillRect(hdc, &rc, g_ui.brSel);
+            SetTextColor(hdc, g_ui.selText);
         } else {
-            FillRect(hdc, &rc, (HBRUSH)(COLOR_WINDOW + 1));
-            SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
+            FillRect(hdc, &rc, g_ui.brField);
+            SetTextColor(hdc, g_ui.fieldText);
         }
         SetBkMode(hdc, TRANSPARENT);
         wchar_t tbuf[512] = { 0 };
@@ -1175,6 +1494,8 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 bool on = IsDlgButtonChecked(g_settingsPage, IDC_LAUNCH_REMINDER) == BST_CHECKED;
                 EnableWindow(GetDlgItem(g_settingsPage, IDC_REMINDER_EDIT), on);
                 EnableWindow(GetDlgItem(g_settingsPage, IDC_REMINDER_TIMEOUT_EDIT), on);
+                // 覆盖功能依附于提醒功能：提醒关闭时置灰不可勾选（勾选状态保留）
+                EnableWindow(GetDlgItem(g_settingsPage, IDC_COVER_WINDOW), on);
             }
             break;
         case IDC_BLOCK_DUP: // 关闭拦截时，拦截气泡通知选项及其文案一并禁用
@@ -1182,6 +1503,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 bool dup  = IsDlgButtonChecked(g_settingsPage, IDC_BLOCK_DUP) == BST_CHECKED;
                 bool noti = IsDlgButtonChecked(g_settingsPage, IDC_BLOCK_NOTIFY) == BST_CHECKED;
                 EnableWindow(GetDlgItem(g_settingsPage, IDC_BLOCK_NOTIFY), dup);
+                EnableWindow(GetDlgItem(g_settingsPage, IDC_DUP_WINDOW_EDIT), dup);
                 EnableWindow(GetDlgItem(g_settingsPage, IDC_TITLE_EDIT), dup && noti);
                 EnableWindow(GetDlgItem(g_settingsPage, IDC_CONTENT_EDIT), dup && noti);
             }
@@ -1221,6 +1543,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         return 0;
 
     case WM_DESTROY:
+        KillTimer(hwnd, IDT_THEME);
         g_settingsWnd = NULL;
         g_settingsPage = NULL;
         if (g_font) {
@@ -1323,9 +1646,15 @@ static void SubclassWhitelistList(HWND wlList) {
 }
 
 // ---------------------------------------------------------------- 启动提醒覆盖层
+//
+// 一条提醒 = 一个分层窗口（WS_EX_LAYERED + UpdateLayeredWindow 逐像素 alpha）：
+//  - 只有逐像素 alpha 才能画出抗锯齿的圆角与描边（窗口区域 SetWindowRgn 是二值裁剪，
+//    角上必然有锯齿），窗口整体的不透明度则由 BLENDFUNCTION 的 SourceConstantAlpha
+//    给出，于是"位移/缩放"和"渐显渐隐"可以同时播放、互不干扰；
+//  - 卡片内容用 GDI+ 画进 32 位 DIB（圆角走 GraphicsPath、文字走 AntiAliasGridFit）；
+//  - 背景优先申请系统模糊材质（Win11 系统背景材质 / Win10 亚克力），申请不到就退回
+//    较不透明的纯色，保证任何系统上都看得清。
 
-// 一条覆盖层提醒的状态。一次“软件启动”对应一条，各条独立窗口互不影响，
-// 可同时弹出多条（例如连续打开两个不同的软件）。同一软件的连续启动复用同一条。
 struct ReminderInst {
     HWND hwnd = NULL;
     std::wstring key;   // 去重键：exe 全路径小写（取不到路径时用显示名）
@@ -1334,15 +1663,53 @@ struct ReminderInst {
     std::wstring app;   // 软件显示名（截断时据此保留“正在启动”等固定文案）
     DWORD timeoutMs = kDefaultReminderTimeout;
     ULONGLONG shownTick = 0;
-    int alpha = 255;
-    int phase = 0; // 0=IDLE 1=STEADY 2=FADE
+    int  phase = 0;     // kRemPhase*
     bool anchoredToClick = false;
     bool anchoredToWnd = false;
-    int tickCount = 0;
+    int  tickCount = 0;
     HFONT font = NULL;
-    HICON icon = NULL;  // 被启动软件的程序图标（SHGetFileInfo 取得，左侧展示）
+    HICON icon = NULL;               // 被启动软件的程序图标（SHGetFileInfo 取得，左侧展示）
+    Gdiplus::Bitmap* iconBmp = NULL; // 同一个图标的 GDI+ 位图（自绘用，保住 alpha 通道）
+    Gdiplus::Font*   gpFont  = NULL; // 由上面的 LOGFONT 生成的 GDI+ 字体（缓存，别每帧重建）
+
+    // 几何与动画（物理像素 / 屏幕坐标）
+    int  x = 0, y = 0, w = 0, h = 0;
+    int  radius = 0;         // 圆角半径（覆盖动画里会随尺寸收窄）
+    int  alpha = 255;        // 当前整体不透明度
+    int  baseAlpha = 255;    // 稳定状态的不透明度
+    bool popFromBelow = true;// true：起点更低（向上滑入）；false：起点更高（向下滑入）
+    int  popY0 = 0;          // 弹出动画起点 y
+    int  popY1 = 0;          // 弹出动画终点 y
+    int  fadeMs = kFadeMs;   // 本次渐隐时长
+    ULONGLONG phaseTick = 0; // 当前阶段开始时刻
+    RECT coverFrom = { 0, 0, 0, 0 };
+    RECT coverTo   = { 0, 0, 0, 0 };
+    HWND targetWnd = NULL;   // 覆盖动画跟随的目标窗口
+
+    // 绘制资源
+    HDC     memDC = NULL;
+    HBITMAP dib = NULL, oldDib = NULL;
+    void*   bits = NULL;
+    int     surfW = 0, surfH = 0; // 实际分配的 DIB 尺寸（只增不减，避免缩放动画每帧重建）
+    bool    dirty = true;
+
+    // 视觉引导动画：提醒超时消失后仍继续等目标窗口，窗口一出现就补播这段动画
+    std::wstring exeName;            // 目标 exe 文件名（小写，用于目标进程已退出时按名字找窗口）
+    std::wstring exePath;            // 目标 exe 全路径（小写，优先按它精确匹配窗口）
+    ULONGLONG   lastPollTick = 0;    // 上一次轮询目标窗口的时刻（轮询按时间算，与时钟频率解耦）
+    ULONGLONG   lastExeScan  = 0;    // 上一次"按 exe 名找窗口"的时刻（这条路径较贵，单独降频）
+    bool        pendingCover = false;// 弹出动画结束后立刻进入"覆盖目标窗口"动画
+    bool        coverDone = false;   // 本次提醒是否已经播放过覆盖动画
+    ULONGLONG   waitUntil = 0;       // 等待目标窗口的截止时刻（0 = 不在等待）
+    // 补播动画必须回到"隐藏前的位置"，否则弹出位置会跑到窗口那边去
+    int  restoreX = 0, restoreY = 0;
+    bool restoreFromBelow = true;
+    // "视觉引导动画"进度 0..1：小窗放大去覆盖目标窗口时，图标一边往中间聚、一边放大，
+    // 文字同时淡出；进度与小窗宽高用的是同一条缓动曲线，所以两者始终同步。
+    double coverT = 0.0;
 };
-static const int kRemPhaseIdle = 0, kRemPhaseSteady = 1, kRemPhaseFade = 2;
+static const int kRemPhaseIdle = 0, kRemPhasePopIn = 1, kRemPhaseSteady = 2,
+                 kRemPhaseCover = 3, kRemPhaseFade = 4, kRemPhaseWait = 5;
 static std::vector<ReminderInst*> g_rems; // 当前显示中的各条提醒（主线程专用）
 
 static ReminderInst* FindReminderByKey(const std::wstring& key) {
@@ -1350,10 +1717,22 @@ static ReminderInst* FindReminderByKey(const std::wstring& key) {
     return NULL;
 }
 
-// 枚举回调：目标 pid 是否已有可见主窗口（用于窗口定位 / 判定“软件完全打开”）
+// 窗口的可见外框：优先用 DWM 的 EXTENDED_FRAME_BOUNDS（不含 Win10/11 那圈看不见的
+// 调整边框），这样"贴窗口"和"覆盖窗口"都不会差出几个像素（避免错位）
+static RECT VisibleWindowRect(HWND h) {
+    RECT ext;
+    if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &ext, sizeof(ext))) &&
+        ext.right > ext.left && ext.bottom > ext.top)
+        return ext;
+    RECT rc = { 0, 0, 0, 0 };
+    GetWindowRect(h, &rc);
+    return rc;
+}
+
+// 枚举回调：目标 pid 是否已有可见主窗口（用于窗口定位 / 判定“软件完全打开” / 覆盖跟随）
+struct FindWndCtx { DWORD pid; HWND hwnd; RECT rc; bool found; };
 static BOOL CALLBACK FindMainWndCB(HWND h, LPARAM lp) {
-    struct FindCtx { DWORD pid; RECT rc; bool found; };
-    FindCtx* ctx = (FindCtx*)lp;
+    FindWndCtx* ctx = (FindWndCtx*)lp;
     DWORD pid = 0;
     GetWindowThreadProcessId(h, &pid);
     if (pid != ctx->pid) return TRUE;
@@ -1364,17 +1743,81 @@ static BOOL CALLBACK FindMainWndCB(HWND h, LPARAM lp) {
     if (rc.right <= rc.left || rc.bottom <= rc.top) return TRUE;
     BOOL cloaked = FALSE;
     if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return TRUE;
-    ctx->rc = rc;
+    ctx->rc = VisibleWindowRect(h);
+    ctx->hwnd = h;
     ctx->found = true;
     return FALSE; // 找到一个即停
 }
 
-static bool FindVisibleMainWindow(DWORD pid, RECT& out) {
-    struct FindCtx { DWORD pid; RECT rc; bool found; };
-    FindCtx ctx = { pid, {}, false };
+static bool FindVisibleMainWindow(DWORD pid, RECT& out, HWND* outWnd = NULL) {
+    FindWndCtx ctx = { pid, NULL, { 0, 0, 0, 0 }, false };
     EnumWindows(FindMainWndCB, (LPARAM)&ctx);
-    if (ctx.found) out = ctx.rc;
+    if (ctx.found) {
+        out = ctx.rc;
+        if (outWnd) *outWnd = ctx.hwnd;
+    }
     return ctx.found;
+}
+
+// 覆盖动画每一帧都要重新确认目标窗口（窗口被移动/缩放时不能让提醒停在旧位置上）
+static bool GetTargetWindowRect(HWND h, RECT& out) {
+    if (!h || !IsWindow(h) || !IsWindowVisible(h) || IsIconic(h)) return false;
+    RECT rc = VisibleWindowRect(h);
+    if (rc.right <= rc.left || rc.bottom <= rc.top) return false;
+    out = rc;
+    return true;
+}
+
+// 按 exe 找可见主窗口：目标进程是个"启动即退出的存根"、真程序窗口稍后才出现时用。
+// 优先按全路径精确匹配（同名不同目录的程序不会被认错），路径不可用时才退回文件名。
+struct FindExeCtx { const std::wstring* exe; const std::wstring* path; HWND hwnd; RECT rc; bool found; };
+static BOOL CALLBACK FindByExeCB(HWND h, LPARAM lp) {
+    FindExeCtx* ctx = (FindExeCtx*)lp;
+    if (!IsWindowVisible(h) || IsIconic(h)) return TRUE;
+    if (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
+    RECT rc;
+    if (!GetWindowRect(h, &rc)) return TRUE;
+    if (rc.right <= rc.left || rc.bottom <= rc.top) return TRUE;
+    BOOL cloaked = FALSE;
+    if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (!pid) return TRUE;
+    std::wstring path = QueryProcPath(pid);
+    if (path.empty()) return TRUE;
+    std::wstring pathLower = Lower(path);
+    if (ctx->path && !ctx->path->empty()) {
+        if (pathLower != *ctx->path) return TRUE; // 有全路径：只认完全一致的那个程序
+    } else if (Lower(GetFileName(path)) != *ctx->exe) {
+        return TRUE;
+    }
+    ctx->rc = VisibleWindowRect(h);
+    ctx->hwnd = h;
+    ctx->found = true;
+    return FALSE; // 找到一个即停
+}
+
+static bool FindWindowByExeName(const std::wstring& exeLower, const std::wstring& pathLower,
+                                RECT& out, HWND* outWnd) {
+    // 第一轮：按全路径精确找（避免把别的目录里的同名程序当成目标）
+    if (!pathLower.empty()) {
+        FindExeCtx ctx = { &exeLower, &pathLower, NULL, { 0, 0, 0, 0 }, false };
+        EnumWindows(FindByExeCB, (LPARAM)&ctx);
+        if (ctx.found) {
+            out = ctx.rc;
+            if (outWnd) *outWnd = ctx.hwnd;
+            return true;
+        }
+    }
+    // 第二轮：退回按文件名（存根退出后真程序换了目录、或拿不到原始路径的情况）
+    if (exeLower.empty()) return false;
+    FindExeCtx ctx2 = { &exeLower, NULL, NULL, { 0, 0, 0, 0 }, false };
+    EnumWindows(FindByExeCB, (LPARAM)&ctx2);
+    if (ctx2.found) {
+        out = ctx2.rc;
+        if (outWnd) *outWnd = ctx2.hwnd;
+    }
+    return ctx2.found;
 }
 
 // 目标进程是否已退出（短命存根 / 被拦截杀掉的第二实例）
@@ -1386,22 +1829,392 @@ static bool TargetProcessExited(DWORD pid) {
     return r == WAIT_OBJECT_0;
 }
 
-// 把某条覆盖层放到锚点上方 8px、水平居中的位置，并钳制在所在显示器工作区内
-static void PositionReminder(ReminderInst* r, POINT anchor) {
-    if (!r || !r->hwnd) return;
+// 计算提醒该出现在哪：锚点上方 8px、水平居中，并钳制在所在显示器工作区内。
+// placedBelow=true 表示上方放不下（点击位置贴着屏幕顶部），于是改放到了锚点下方，
+// 弹出动画的方向也要跟着反过来（从上往下）。
+static RECT ComputeReminderRect(POINT anchor, int w, int h, bool& placedBelow) {
     HMONITOR mon = MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi;
     mi.cbSize = sizeof(mi);
     GetMonitorInfoW(mon, &mi);
     RECT wa = mi.rcWork;
-    int x = anchor.x - OverlayW() / 2;
-    int y = anchor.y - Sx(8) - OverlayH();
+    int x = anchor.x - w / 2;
+    int y = anchor.y - Sx(8) - h;
+    placedBelow = false;
     if (x < wa.left) x = wa.left;
-    if (x + OverlayW() > wa.right) x = wa.right - OverlayW();
-    if (y < wa.top) y = anchor.y + Sx(8); // 上方放不下则移到锚点下方
-    if (y + OverlayH() > wa.bottom) y = wa.bottom - OverlayH();
-    SetWindowPos(r->hwnd, HWND_TOPMOST, x, y, 0, 0,
-                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (x + w > wa.right) x = wa.right - w;
+    if (y < wa.top) { y = anchor.y + Sx(8); placedBelow = true; } // 上方放不下则移到锚点下方
+    if (y + h > wa.bottom) y = wa.bottom - h;
+    RECT rc = { x, y, x + w, y + h };
+    return rc;
+}
+
+// ---------------------------------------------------------------- 覆盖层配色
+
+// 覆盖层配色（跟随系统明暗）。这里不使用任何系统模糊/亚克力/云母材质：
+// 实测材质的绘制范围是"整块窗口矩形"，与逐像素 alpha 的透明区域无关，
+// 一旦生效就会从卡片圆角外的透明像素里透出来（表现为白色直角底），
+// 而且分层窗口采样不到背后内容、根本得不到真模糊。
+// 逐像素 alpha 才能做出抗锯齿圆角 + 渐隐动画，所以采用半透明纯色底
+// （按需求"透明度不要很高"：浅色 98%、深色 96%）。
+struct RemTheme {
+    COLORREF bg, border, text;
+    int bgAlpha;
+    int borderAlpha;
+};
+static RemTheme ReminderColors() {
+    RemTheme t;
+    if (g_sysDark) {
+        t.bg          = RGB(28, 28, 30);
+        t.border      = RGB(140, 140, 145); // 灰色描边：和浅色版一样是实描边（之前 alpha 只有 170，深色下几乎看不见）
+        t.text        = RGB(240, 240, 240);
+        t.bgAlpha     = 246;
+        t.borderAlpha = 255;
+    } else {
+        t.bg          = RGB(255, 251, 225); // 浅黄底（与旧版一致）
+        t.border      = RGB(210, 170, 70);
+        t.text        = RGB(60, 60, 60);
+        t.bgAlpha     = 250;
+        t.borderAlpha = 255;
+    }
+    return t;
+}
+
+// ---------------------------------------------------------------- 覆盖层绘制
+
+// 覆盖层要能在"整块窗口那么大"的尺寸上逐帧重绘（"移动到目标窗口并覆盖"的动画），
+// 所以背景不能每帧都丢给 GDI+ 的路径抗锯齿去填几百万像素（那样只能跑到 20~30fps）：
+//   - 纯色底与 4 条直边用连续的 DWORD 填充（顺序写内存，最快，且轴对齐的边不需要抗锯齿）；
+//   - 只有 4 个圆角需要抗锯齿，按"半径 + 配色"预渲染成 4 张小角块缓存起来，每帧直接拷贝；
+//   - 文字与图标面积很小，仍然交给 GDI+ 抗锯齿。
+
+// 预乘 alpha 的 32 位像素（BGRA，与 UpdateLayeredWindow 的 AC_SRC_ALPHA 要求一致）
+static DWORD PremulColor(COLORREF c, int a) {
+    if (a < 0) a = 0;
+    if (a > 255) a = 255;
+    DWORD r = (DWORD)(GetRValue(c) * a / 255);
+    DWORD g = (DWORD)(GetGValue(c) * a / 255);
+    DWORD b = (DWORD)(GetBValue(c) * a / 255);
+    return ((DWORD)a << 24) | (r << 16) | (g << 8) | b;
+}
+
+// 用同一个颜色快速填一块矩形（32bpp 预乘 alpha）。
+// 先填第一行，其余行整行 memcpy：memcpy 是向量化的，整屏尺寸下比逐像素循环快好几倍。
+static void FillPixels(void* bits, int stride, int x, int y, int w, int h, DWORD pm) {
+    if (!bits || w <= 0 || h <= 0) return;
+    BYTE* base = (BYTE*)bits + (size_t)y * stride + (size_t)x * 4;
+    DWORD* first = (DWORD*)base;
+    for (int xx = 0; xx < w; ++xx) first[xx] = pm;
+    for (int yy = 1; yy < h; ++yy)
+        memcpy(base + (size_t)yy * stride, base, (size_t)w * 4);
+}
+
+// 圆角矩形路径（角块与整体绘制共用同一条几何，保证形状完全一致）
+static void AddRoundRectPath(Gdiplus::GraphicsPath& path, float x, float y,
+                             float w, float h, float rad) {
+    float d = rad * 2.0f;
+    if (d > w) d = w;
+    if (d > h) d = h;
+    if (d < 1.0f) d = 1.0f;
+    path.StartFigure();
+    path.AddArc(x, y, d, d, 180.0f, 90.0f);
+    path.AddArc(x + w - d, y, d, d, 270.0f, 90.0f);
+    path.AddArc(x + w - d, y + h - d, d, d, 0.0f, 90.0f);
+    path.AddArc(x, y + h - d, d, d, 90.0f, 90.0f);
+    path.CloseFigure();
+}
+
+// 4 个圆角的预渲染角块（配色/半径不变时一直复用，只在换主题时重建一次）
+struct CornerTiles {
+    bool     valid = false;
+    int      radius = 0;
+    COLORREF bg = 0, border = 0;
+    int      bgAlpha = 0, borderAlpha = 0;
+    int      size = 0;              // 每块边长
+    std::vector<DWORD> px[4];       // 左上 / 右上 / 左下 / 右下
+};
+static CornerTiles g_cornerTiles;
+
+static void BuildCornerTiles(int radius, COLORREF bg, int bgAlpha,
+                            COLORREF border, int borderAlpha) {
+    if (radius < 2) radius = 2;
+    if (g_cornerTiles.valid && g_cornerTiles.radius == radius &&
+        g_cornerTiles.bg == bg && g_cornerTiles.bgAlpha == bgAlpha &&
+        g_cornerTiles.border == border && g_cornerTiles.borderAlpha == borderAlpha)
+        return;
+
+    const int R = radius;
+    const int S = 3 * R + 2; // 临时画布：两个圆角 + 中间直边都放得下
+    const int T = R + 1;     // 每块角块边长（含抗锯齿边缘）
+    if (T > S) return;
+
+    HDC screen = GetDC(NULL);
+    HDC dc = CreateCompatibleDC(screen);
+    ReleaseDC(NULL, screen);
+    if (!dc) return;
+    BITMAPINFO bi;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = S;
+    bi.bmiHeader.biHeight      = -S;
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = NULL;
+    HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!bmp) {
+        DeleteDC(dc);
+        return;
+    }
+    HBITMAP oldBmp = (HBITMAP)SelectObject(dc, bmp);
+    memset(bits, 0, (size_t)S * S * 4);
+    {
+        // 画一次"和大卡片几何完全一致"的圆角矩形，再抠出四个角
+        Gdiplus::Bitmap gb(S, S, S * 4, PixelFormat32bppPARGB, (BYTE*)bits);
+        Gdiplus::Graphics g(&gb);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        Gdiplus::GraphicsPath path;
+        AddRoundRectPath(path, 0.5f, 0.5f, (float)S - 1.0f, (float)S - 1.0f, (float)R);
+        Gdiplus::SolidBrush bgBrush(Gdiplus::Color((BYTE)bgAlpha, GetRValue(bg),
+                                                   GetGValue(bg), GetBValue(bg)));
+        g.FillPath(&bgBrush, &path);
+        Gdiplus::Pen pen(Gdiplus::Color((BYTE)borderAlpha, GetRValue(border),
+                                        GetGValue(border), GetBValue(border)), 1.0f);
+        g.DrawPath(&pen, &path);
+    }
+    g_cornerTiles.size = T;
+    for (int c = 0; c < 4; ++c) {
+        int sx = (c == 1 || c == 3) ? S - T : 0;
+        int sy = (c == 2 || c == 3) ? S - T : 0;
+        g_cornerTiles.px[c].assign((size_t)T * T, 0);
+        for (int y = 0; y < T; ++y)
+            memcpy(&g_cornerTiles.px[c][(size_t)y * T],
+                   (BYTE*)bits + (size_t)(sy + y) * S * 4 + (size_t)sx * 4,
+                   (size_t)T * 4);
+    }
+    SelectObject(dc, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+
+    g_cornerTiles.radius      = radius;
+    g_cornerTiles.bg          = bg;
+    g_cornerTiles.bgAlpha     = bgAlpha;
+    g_cornerTiles.border      = border;
+    g_cornerTiles.borderAlpha = borderAlpha;
+    g_cornerTiles.valid       = true;
+}
+
+// 分配（必要时扩容）32 位 DIB 画布。只增不减：覆盖动画每帧尺寸都在变，
+// 每帧重建位图会很浪费。
+static void EnsureSurface(ReminderInst* r, int needW, int needH) {
+    if (needW < 1) needW = 1;
+    if (needH < 1) needH = 1;
+    if (r->memDC && r->surfW >= needW && r->surfH >= needH) return;
+    if (r->memDC) {
+        if (r->oldDib) SelectObject(r->memDC, r->oldDib);
+        if (r->dib) DeleteObject(r->dib);
+        DeleteDC(r->memDC);
+        r->memDC = NULL; r->dib = NULL; r->oldDib = NULL; r->bits = NULL;
+    }
+    int w = (needW > r->surfW) ? needW : r->surfW;
+    int h = (needH > r->surfH) ? needH : r->surfH;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    HDC screen = GetDC(NULL);
+    r->memDC = CreateCompatibleDC(screen);
+    ReleaseDC(NULL, screen);
+    if (!r->memDC) return;
+    BITMAPINFO bi;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = w;
+    bi.bmiHeader.biHeight      = -h; // 负数=自上而下，与 GDI+ 坐标一致
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = NULL;
+    r->dib = CreateDIBSection(r->memDC, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!r->dib) {
+        DeleteDC(r->memDC);
+        r->memDC = NULL;
+        return;
+    }
+    r->bits  = bits;
+    r->oldDib = (HBITMAP)SelectObject(r->memDC, r->dib);
+    r->surfW = w;
+    r->surfH = h;
+    r->dirty = true;
+}
+
+// 把卡片画进 DIB：抗锯齿圆角背景 + 描边 + 程序图标 + 文本
+static void RenderReminderContent(ReminderInst* r) {
+    if (!r || !r->bits || r->w < 1 || r->h < 1) return;
+    const int W = r->w, H = r->h;
+    const int stride = r->surfW * 4;
+    RemTheme th = ReminderColors();
+
+    int radius = (r->radius > 0) ? r->radius : Sx(16);
+    int maxR = (W < H ? W : H) / 2;
+    if (radius > maxR) radius = maxR;
+    if (radius < 2) radius = 2;
+
+    // ---- 背景：整块纯色 + 4 条直边 + 4 个预渲染角块（见本节开头的性能说明）
+    FillPixels(r->bits, stride, 0, 0, W, H, PremulColor(th.bg, th.bgAlpha));
+    const DWORD pmBorder = PremulColor(th.border, th.borderAlpha);
+    FillPixels(r->bits, stride, radius, 0, W - 2 * radius, 1, pmBorder);
+    FillPixels(r->bits, stride, radius, H - 1, W - 2 * radius, 1, pmBorder);
+    FillPixels(r->bits, stride, 0, radius, 1, H - 2 * radius, pmBorder);
+    FillPixels(r->bits, stride, W - 1, radius, 1, H - 2 * radius, pmBorder);
+
+    BuildCornerTiles(radius, th.bg, th.bgAlpha, th.border, th.borderAlpha);
+    const int T = g_cornerTiles.size;
+    if (g_cornerTiles.valid && T <= W && T <= H) {
+        for (int c = 0; c < 4; ++c) {
+            int dx = (c == 1 || c == 3) ? W - T : 0;
+            int dy = (c == 2 || c == 3) ? H - T : 0;
+            const DWORD* src = g_cornerTiles.px[c].data();
+            for (int y = 0; y < T; ++y)
+                memcpy((BYTE*)r->bits + (size_t)(dy + y) * stride + (size_t)dx * 4,
+                       src + (size_t)y * T, (size_t)T * 4);
+        }
+    }
+
+    // ---- 文字与图标：面积小，交给 GDI+
+    // 文本布局仍用 GDI 量宽度（沿用原有的截断/居中规则），只是画的时候交给 GDI+
+    HFONT f = r->font ? r->font : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HFONT oldFont = (HFONT)SelectObject(r->memDC, f);
+
+    int iconSize  = Sx(18);
+    int iconLeft  = Sx(14);
+    int iconRight = Sx(14);
+    bool hasIcon  = (r->iconBmp != NULL);
+    if (hasIcon) iconRight += iconSize + Sx(10);
+    int right = W - Sx(14);
+    if (right < iconRight) right = iconRight;
+
+    SIZE tsz = { 0, 0 };
+    GetTextExtentPoint32W(r->memDC, r->text.c_str(), (int)r->text.size(), &tsz);
+    std::wstring disp;
+    int textLeft = iconRight;
+    if (tsz.cx <= right - iconRight) {
+        // 整段放得下：图标+文字作为一组居中摆放，避免短软件名时右侧大片空白
+        int gap = hasIcon ? Sx(10) : 0;
+        int groupW = (hasIcon ? iconSize : 0) + gap + tsz.cx;
+        int groupLeft = (W - groupW) / 2;
+        if (groupLeft < Sx(10)) groupLeft = Sx(10);
+        if (hasIcon) iconLeft = groupLeft;
+        textLeft = groupLeft + (hasIcon ? iconSize + gap : 0);
+        if (textLeft < iconRight) textLeft = iconRight;
+        disp = r->text;
+    } else {
+        // 放不下时：省略的是软件名“后面的部分”，完整保留“正在启动”等固定文案，
+        // 输出形如“名字开头...正在启动，请稍候”。
+        disp = FitMiddleText(r->text, r->app, r->memDC, f, right - iconRight);
+    }
+    SelectObject(r->memDC, oldFont);
+    if (!hasIcon && disp.empty()) {
+        r->dirty = false;
+        return;
+    }
+
+    // GDI+ 字体由同一个 LOGFONT 生成（字号/字形与 GDI 一致），缓存起来避免每帧重建。
+    // 必须在把 DIB 从 DC 里撤出之前创建：Font(HDC, LOGFONT) 要用 DC 的 DPI 信息。
+    if (!r->gpFont && !disp.empty()) {
+        LOGFONTW lf;
+        ZeroMemory(&lf, sizeof(lf));
+        if (GetObjectW(f, sizeof(lf), &lf) == 0) lf.lfHeight = -Sx(12);
+        Gdiplus::Font* pf = new Gdiplus::Font(r->memDC, &lf);
+        if (pf->GetLastStatus() == Gdiplus::Ok) r->gpFont = pf;
+        else delete pf;
+    }
+
+    // GDI 与 GDI+ 不要同时持有同一块 DIB：画之前把位图从 DC 里撤出，画完再选回去。
+    // （两者同时引用同一块内存时，个别驱动上可能出现花屏/撕裂。）
+    if (r->dib) SelectObject(r->memDC, r->oldDib);
+    {
+    Gdiplus::Bitmap gbmp(W, H, stride, PixelFormat32bppPARGB, (BYTE*)r->bits);
+    Gdiplus::Graphics g(&gbmp);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+
+    // 视觉引导动画进度：0 = 普通小窗；1 = 已经盖住目标窗口。
+    // 图标从"左侧原始位置/原始大小"过渡到"整块中央、放大到 kCoverIconGrow%"，
+    // 文字同步淡出。进度用的是与小窗宽高完全相同的缓动值，所以始终同步。
+    double ct = r->coverT;
+    if (ct < 0.0) ct = 0.0;
+    if (ct > 1.0) ct = 1.0;
+
+    if (hasIcon) {
+        int baseSize  = iconSize;
+        int baseLeft  = iconLeft;
+        int baseTop   = (H - baseSize) / 2;
+        double grow   = 1.0 + ((double)kCoverIconGrow / 100.0 - 1.0) * ct;
+        int sz = (int)(baseSize * grow + 0.5);
+        int cap = H / 4; // 目标窗口很扁/很矮时别把图标放得过大
+        if (cap > baseSize && sz > cap) sz = cap;
+        if (sz < 1) sz = 1;
+        double cx = baseLeft + baseSize / 2.0;
+        double cy = baseTop + baseSize / 2.0;
+        int tx = (int)(cx + (W / 2.0 - cx) * ct + 0.5);
+        int ty = (int)(cy + (H / 2.0 - cy) * ct + 0.5);
+        Gdiplus::Rect dst(tx - sz / 2, ty - sz / 2, sz, sz);
+        g.DrawImage(r->iconBmp, dst, 0, 0, (INT)r->iconBmp->GetWidth(),
+                    (INT)r->iconBmp->GetHeight(), Gdiplus::UnitPixel);
+    }
+    if (!disp.empty() && ct < 1.0) {
+        if (r->gpFont) {
+            // GenericTypographic：去掉默认格式自带的那圈内边距，位置才好算准
+            const Gdiplus::StringFormat* fmt = Gdiplus::StringFormat::GenericTypographic();
+            int textA = (int)(255.0 * (1.0 - ct) + 0.5); // 文字随进度淡出
+            if (textA > 0) {
+                Gdiplus::SolidBrush tb(Gdiplus::Color((BYTE)textA, GetRValue(th.text),
+                                                      GetGValue(th.text), GetBValue(th.text)));
+                Gdiplus::REAL lh = r->gpFont->GetHeight(&g);
+                Gdiplus::REAL ty = ((Gdiplus::REAL)H - lh) / 2.0f;
+                g.DrawString(disp.c_str(), (INT)disp.size(), r->gpFont,
+                             Gdiplus::PointF((Gdiplus::REAL)textLeft, ty), fmt, &tb);
+            }
+        }
+    }
+    } // gbmp / g 在这里析构：此后 GDI+ 不再持有这块 DIB
+    if (r->dib) r->oldDib = (HBITMAP)SelectObject(r->memDC, r->dib);
+    r->dirty = false;
+}
+
+// 把 DIB 按当前矩形与整体不透明度送上屏幕（逐像素 alpha）
+static void PresentReminder(ReminderInst* r) {    if (!r || !r->hwnd || !r->memDC) return;
+    if (r->dirty) RenderReminderContent(r);
+    HDC screen = GetDC(NULL);
+    if (!screen) return;
+    POINT dst = { r->x, r->y };
+    SIZE  sz  = { r->w, r->h };
+    POINT src = { 0, 0 };
+    int a = r->alpha;
+    if (a < 0) a = 0;
+    if (a > 255) a = 255;
+    BLENDFUNCTION bf;
+    bf.BlendOp             = AC_SRC_OVER;
+    bf.BlendFlags          = 0;
+    bf.SourceConstantAlpha = (BYTE)a;
+    bf.AlphaFormat         = AC_SRC_ALPHA;
+    UpdateLayeredWindow(r->hwnd, screen, &dst, &sz, r->memDC, &src, 0, &bf, ULW_ALPHA);
+    ReleaseDC(NULL, screen);
+}
+
+// 缓动：末尾带轻微回弹（弹出动画用；back 越大过冲越明显）
+static double EaseOutBack(double t, double back) {
+    double u = t - 1.0;
+    return 1.0 + (back + 1.0) * u * u * u + back * u * u;
+}
+
+// 缓动：平滑进出、不回弹（覆盖动画用）
+static double EaseInOutCubic(double t) {
+    if (t < 0.5) return 4.0 * t * t * t;
+    double u = -2.0 * t + 2.0;
+    return 1.0 - (u * u * u) / 2.0;
 }
 
 // 登记覆盖层窗口类（类已存在时会被系统忽略）
@@ -1416,18 +2229,102 @@ static void RegisterReminderClass() {
     RegisterClassExW(&wc);
 }
 
+// ---------------------------------------------------------------- 动画时钟
+// 为什么不再用 SetTimer：普通定时器受系统时钟粒度（约 15.6ms）和"定时器合并"（timer
+// coalescing）影响，即使把 uToleranceDelay 设为 0，请求 16ms 实测也只有 ~22~31ms 一跳
+// （也就是 30~45 帧）。这里改用 Win10 1803+ 官方推荐的高精度可等待定时器
+// （CREATE_WAITABLE_TIMER_HIGH_RESOLUTION），直接在主线程消息循环里等它，按 16ms 推进动画。
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+static HANDLE g_animTimer  = NULL;
+static volatile LONG g_animActive = 0; // 时钟是否已武装（有提醒在显示）
+static int  g_animPeriodMs = 0;        // 当前时钟周期（16=有动画，100=仅轮询）
+static bool g_animTimerHiRes = false;  // 是否成功拿到高精度可等待定时器
+static bool g_remHiRes = false;         // 是否已把系统时钟精度提到 1ms
+
+// 系统时钟精度只在"真的在放动画、且退回的是普通定时器"时提高；
+// 稳定/等待阶段不提高、动画结束立刻恢复，避免无谓唤醒费电。
+static void ReminderHiResSet(bool on) {
+    if (on == g_remHiRes) return;
+    g_remHiRes = on;
+    if (on) timeBeginPeriod(1); else timeEndPeriod(1);
+}
+
+static void AnimClockInit() {
+    if (g_animTimer) return;
+    g_animTimer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                         TIMER_ALL_ACCESS);
+    g_animTimerHiRes = (g_animTimer != NULL);
+    if (!g_animTimer) g_animTimer = CreateWaitableTimerW(NULL, FALSE, NULL); // 老系统退回普通定时器
+}
+
+// 现在需要多快的时钟：有弹出/覆盖/渐隐动画就 16ms，否则 100ms 足够
+// （稳定/等待阶段只是每隔一两百毫秒轮询一次目标窗口）。
+static int DesiredClockPeriod() {
+    for (size_t i = 0; i < g_rems.size(); ++i) {
+        int p = g_rems[i]->phase;
+        if (p == kRemPhasePopIn || p == kRemPhaseCover || p == kRemPhaseFade) return kRemTimerMs;
+    }
+    return kRemIdleTickMs;
+}
+
+// 武装时钟。幂等：周期没变就不重设（SetWaitableTimer 的 due=0 会立刻触发，
+// 每帧都重设会让消息循环空转）。
+static void AnimClockArm() {
+    AnimClockInit();
+    int period = DesiredClockPeriod();
+    bool reactivate = (InterlockedExchange(&g_animActive, 1) == 0);
+    if (g_animTimer && (reactivate || period != g_animPeriodMs)) {
+        LARGE_INTEGER due;
+        due.QuadPart = 0; // 立即触发，之后每 period 毫秒一次
+        SetWaitableTimer(g_animTimer, &due, period, NULL, NULL, FALSE);
+    }
+    g_animPeriodMs = period; // 没有可等待定时器时，消息循环的兜底超时也按这个周期
+    // 高精度定时器自带精度，不需要提系统精度；只有退回普通定时器且正在放动画时才提
+    ReminderHiResSet(!g_animTimerHiRes && period == kRemTimerMs);
+}
+
+// 没有提醒要动了就撤掉时钟，彻底安静下来
+static void AnimClockDisarm() {
+    InterlockedExchange(&g_animActive, 0);
+    g_animPeriodMs = 0;
+    ReminderHiResSet(false);
+    if (g_animTimer) CancelWaitableTimer(g_animTimer);
+}
+
+// 推进所有在显示的提醒一帧。窗口可能在动画里被销毁，所以先取句柄快照、
+// 每次再用 GWLP_USERDATA 换取（此刻仍有效的）实例指针。
+static void ReminderTickAll() {
+    if (g_rems.empty()) return;
+    std::vector<HWND> wins;
+    wins.reserve(g_rems.size());
+    for (size_t i = 0; i < g_rems.size(); ++i) wins.push_back(g_rems[i]->hwnd);
+    for (size_t i = 0; i < wins.size(); ++i) {
+        HWND h = wins[i];
+        if (!h || !IsWindow(h)) continue;
+        ReminderInst* r = (ReminderInst*)GetWindowLongPtrW(h, GWLP_USERDATA);
+        if (r) ReminderTimerTick(r);
+    }
+    // 阶段可能刚变过（动画结束 / 进入等待）：按需在 16ms 与 100ms 之间切换时钟频率。
+    // 周期没变时 AnimClockArm 是空操作；提醒全都消失时 RemoveReminder 已撤掉时钟。
+    if (!g_rems.empty()) AnimClockArm();
+}
+
 // 创建一条覆盖层提醒（独立窗口），挂入 g_rems 后返回
-static ReminderInst* CreateReminder() {
-    RegisterReminderClass();
+static ReminderInst* CreateReminder() {    RegisterReminderClass();
     HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
                                 WS_EX_LAYERED | WS_EX_TRANSPARENT,
                                 kReminderClass, L"", WS_POPUP,
                                 0, 0, OverlayW(), OverlayH(), NULL, NULL, g_hInst, NULL);
     if (!hwnd) return NULL;
-    HRGN rgn = CreateRoundRectRgn(0, 0, OverlayW() + 1, OverlayH() + 1, Sx(16), Sx(16));
-    SetWindowRgn(hwnd, rgn, TRUE); // 区域句柄所有权移交窗口，无需删除
+    // 不再用 SetWindowRgn 切圆角：区域裁剪是二值的，角上一定有锯齿。
+    // 圆角与描边由逐像素 alpha 的自绘内容给出（见 RenderReminderContent）。
     ReminderInst* r = new ReminderInst();
     r->hwnd = hwnd;
+    r->radius = Sx(16);
     NONCLIENTMETRICSW ncm;
     ncm.cbSize = sizeof(ncm);
     SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
@@ -1437,15 +2334,33 @@ static ReminderInst* CreateReminder() {
     return r;
 }
 
-// 释放一条提醒：从列表移除并回收图标/字体（在窗口 WM_NCDESTROY 里调用）
+// 释放一条提醒：从列表移除并回收绘制资源（在窗口 WM_NCDESTROY 里调用）
 static void RemoveReminder(ReminderInst* r) {
     if (!r) return;
     for (size_t i = 0; i < g_rems.size(); ++i) {
         if (g_rems[i] == r) { g_rems.erase(g_rems.begin() + i); break; }
     }
+    if (r->gpFont) delete r->gpFont;
+    if (r->memDC) {
+        if (r->oldDib) SelectObject(r->memDC, r->oldDib);
+        if (r->dib) DeleteObject(r->dib);
+        DeleteDC(r->memDC);
+    }
+    if (r->iconBmp) delete r->iconBmp;
     if (r->icon) DestroyIcon(r->icon);
     if (r->font) DeleteObject(r->font);
+    if (g_rems.empty()) AnimClockDisarm(); // 最后一条也消失了：停掉动画时钟
     delete r;
+}
+
+// 系统明暗变化时，让所有在显示的提醒按新配色重绘
+static void RefreshReminderTheme() {
+    g_cornerTiles.valid = false; // 配色变了，角块缓存作废
+    for (auto* r : g_rems) {
+        if (!r || !r->hwnd) continue;
+        r->dirty = true;
+        PresentReminder(r);
+    }
 }
 
 static LRESULT CALLBACK ReminderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1453,76 +2368,15 @@ static LRESULT CALLBACK ReminderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     switch (msg) {
     case WM_NCHITTEST:
         return HTTRANSPARENT; // 点击穿透，只作通知
-    case WM_TIMER:
-        ReminderTimerTick(r);
-        return 0;
+    case WM_ERASEBKGND:
+        return 1; // 内容全部由 UpdateLayeredWindow 提供，擦背景只会闪
     case WM_NCDESTROY:
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         RemoveReminder(r); // 窗口销毁时回收本条实例（此后不再访问 r / hwnd）
         return 0;
-    case WM_PAINT: {
-        if (!r) break;
+    case WM_PAINT: { // 分层窗口不靠 WM_PAINT 出内容，这里只是把无效区标记为已处理
         PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hwnd, &ps);
-        HDC mdc = CreateCompatibleDC(hdc);
-        HBITMAP bmp = CreateCompatibleBitmap(hdc, OverlayW(), OverlayH());
-        HBITMAP oldBmp = (HBITMAP)SelectObject(mdc, bmp);
-        // 先填满整个窗口（避免 layered 窗口未绘制区域露出黑色），再沿圆角路径描边：
-        // 路径几何与窗口圆角区域一致，四角描边完整，也不会产生黑色边缘
-        RECT rc = { 0, 0, OverlayW(), OverlayH() };
-        HBRUSH bg = CreateSolidBrush(RGB(255, 251, 225)); // 浅黄底
-        FillRect(mdc, &rc, bg);
-        DeleteObject(bg);
-        HPEN pen = CreatePen(PS_SOLID, 1, RGB(210, 170, 70));
-        HPEN oldPn = (HPEN)SelectObject(mdc, pen);
-        HBRUSH oldBr = (HBRUSH)SelectObject(mdc, GetStockObject(NULL_BRUSH)); // 仅描边不填充
-        BeginPath(mdc);
-        RoundRect(mdc, 1, 1, OverlayW() - 1, OverlayH() - 1, Sx(16), Sx(16));
-        EndPath(mdc);
-        StrokePath(mdc);
-        SelectObject(mdc, oldPn);
-        SelectObject(mdc, oldBr);
-        DeleteObject(pen);
-        SetBkMode(mdc, TRANSPARENT);
-        SetTextColor(mdc, RGB(60, 60, 60));
-        HFONT f = r->font ? r->font : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-        HFONT oldFont = (HFONT)SelectObject(mdc, f);
-
-        // 左侧绘制被启动软件的程序图标（无图标时省略）
-        int iconSize = Sx(18);
-        int iconRight = Sx(14);
-        bool hasIcon = (r->icon != NULL);
-        if (hasIcon) {
-            DrawIconEx(mdc, Sx(14), (OverlayH() - iconSize) / 2, r->icon,
-                       iconSize, iconSize, 0, NULL, DI_NORMAL);
-            iconRight += iconSize + Sx(10); // 图标右侧与文字之间留间距
-        }
-        int right = OverlayW() - Sx(14);
-
-        SIZE tsz;
-        GetTextExtentPoint32W(mdc, r->text.c_str(), (int)r->text.size(), &tsz);
-        RECT tr;
-        if (tsz.cx <= right - iconRight) {
-            // 整段放得下：图标+文字作为一组居中摆放，避免短软件名时右侧大片空白
-            int gap = hasIcon ? Sx(10) : 0;
-            int groupW = (hasIcon ? iconSize : 0) + gap + tsz.cx;
-            int textLeft = (OverlayW() - groupW) / 2 + (hasIcon ? iconSize + gap : 0);
-            if (textLeft < iconRight) textLeft = iconRight;
-            tr = { textLeft, 0, right, OverlayH() };
-            DrawTextW(mdc, r->text.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        } else {
-            // 放不下时：省略的是软件名“后面的部分”，完整保留“正在启动”等固定文案，
-            // 输出形如“名字开头...正在启动，请稍候”。
-            int avail = right - iconRight;
-            std::wstring disp = FitMiddleText(r->text, r->app, mdc, f, avail);
-            tr = { iconRight, 0, right, OverlayH() };
-            DrawTextW(mdc, disp.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        }
-        SelectObject(mdc, oldFont);
-        BitBlt(hdc, 0, 0, OverlayW(), OverlayH(), mdc, 0, 0, SRCCOPY);
-        SelectObject(mdc, oldBmp);
-        DeleteObject(bmp);
-        DeleteDC(mdc);
+        BeginPaint(hwnd, &ps);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -1530,48 +2384,255 @@ static LRESULT CALLBACK ReminderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// 单窗口定时器（50ms）：每 3 tick（≈150ms）轮询目标主窗口/进程存活/超时，驱动淡出
+// 进入渐隐阶段
+static void StartReminderFade(ReminderInst* r, int ms) {
+    r->phase = kRemPhaseFade;
+    r->phaseTick = GetTickCount64();
+    r->fadeMs = ms > 0 ? ms : kFadeMs;
+}
+
+// 进入"移动到目标窗口并覆盖"阶段
+static void StartReminderCover(ReminderInst* r, HWND target, const RECT& wr) {
+    r->phase = kRemPhaseCover;
+    r->phaseTick = GetTickCount64();
+    r->coverFrom.left = r->x;  r->coverFrom.top = r->y;
+    r->coverFrom.right = r->x + r->w; r->coverFrom.bottom = r->y + r->h;
+    r->coverTo = wr;
+    r->targetWnd = target;
+    r->anchoredToWnd = true;
+    r->coverDone = true; // 引导动画已经播过，之后超时消失就不必再等目标窗口了
+    // 目标尺寸可能很大，先把画布按目标大小备好，动画过程中就不必反复重建位图
+    EnsureSurface(r, wr.right - wr.left, wr.bottom - wr.top);
+}
+
+// 每 16ms 一次：推进弹出/覆盖/渐隐动画，并（按需）轮询目标窗口
 static void ReminderTimerTick(ReminderInst* r) {
     if (!r || !r->hwnd) return;
     ULONGLONG now = GetTickCount64();
     ++r->tickCount;
-    if (r->tickCount % 3 == 0) {
-        RECT wr;
-        bool hasWnd = FindVisibleMainWindow(r->targetPid, wr);
-        // 第②级定位：没拿到点击位置时，主窗口一出现就贴到窗口上沿
-        if (hasWnd && !r->anchoredToClick && !r->anchoredToWnd) {
-            POINT a = { (wr.left + wr.right) / 2, wr.top };
-            PositionReminder(r, a);
-            r->anchoredToWnd = true;
+
+    if (r->phase == kRemPhasePopIn) {
+        // ② 弹出：位移走"回弹"曲线，渐显走更短的时长（渐显比位移先完成）
+        double t = (double)(now - r->phaseTick) / (double)kPopMs;
+        if (t > 1.0) t = 1.0;
+        double e = EaseOutBack(t, kPopBack / 100.0);
+        r->y = (int)(r->popY0 + (r->popY1 - r->popY0) * e + (e >= 0 ? 0.5 : -0.5));
+        double ft = (double)(now - r->phaseTick) / (double)kPopFadeMs;
+        if (ft > 1.0) ft = 1.0;
+        r->alpha = (int)(r->baseAlpha * ft + 0.5);
+        if (t >= 1.0) {
+            r->y = r->popY1;
+            r->alpha = r->baseAlpha;
+            r->phase = kRemPhaseSteady;
+            r->phaseTick = now;
+            // 补播的引导动画：弹出结束后立刻接着去覆盖目标窗口
+            if (r->pendingCover) {
+                r->pendingCover = false;
+                RECT tw = { 0, 0, 0, 0 };
+                HWND hw = r->targetWnd;
+                if (!hw || !GetTargetWindowRect(hw, tw)) {
+                    hw = NULL;
+                    if (!FindVisibleMainWindow(r->targetPid, tw, &hw))
+                        FindWindowByExeName(r->exeName, r->exePath, tw, &hw);
+                }
+                if (hw) StartReminderCover(r, hw, tw);
+            }
         }
-        if (hasWnd || (now - r->shownTick >= r->timeoutMs) ||
-            TargetProcessExited(r->targetPid))
-            r->phase = kRemPhaseFade;
+        PresentReminder(r);
+        return;
     }
+
+    if (r->phase == kRemPhaseSteady) {
+        // 按时间轮询（与时钟频率无关）：稳定阶段本来就不需要 60fps
+        if (now - r->lastPollTick < (ULONGLONG)kRemPollMs) return;
+        r->lastPollTick = now;
+        RECT wr;
+        HWND hw = NULL;
+        bool hasWnd = FindVisibleMainWindow(r->targetPid, wr, &hw);
+        // 第②级定位：没拿到点击位置时，主窗口一出现就贴到窗口上沿
+        // （开启"覆盖目标窗口"时不在这里贴，交给下面的覆盖动画一次到位，避免动画起点错位）
+        EnterCriticalSection(&g_settingsLock);
+        bool cover = g_settings.coverWindow;
+        LeaveCriticalSection(&g_settingsLock);
+        if (hasWnd && !cover && !r->anchoredToClick && !r->anchoredToWnd) {
+            POINT a = { (wr.left + wr.right) / 2, wr.top };
+            bool below = false;
+            RECT rc = ComputeReminderRect(a, r->w, r->h, below);
+            r->x = rc.left;
+            r->y = rc.top;
+            r->anchoredToWnd = true;
+            PresentReminder(r);
+        }
+        if (hasWnd) {
+            if (cover) {
+                // ④ 目标窗口已经显示：移动到窗口位置并放大到窗口大小，覆盖其上
+                StartReminderCover(r, hw, wr);
+                return;
+            }
+            StartReminderFade(r, kFadeMs); // 窗口已出现，提醒没用了
+        } else if (now - r->shownTick >= r->timeoutMs || TargetProcessExited(r->targetPid)) {
+            StartReminderFade(r, kFadeMs); // 超时或进程已退出
+        }
+        return;
+    }
+
+    if (r->phase == kRemPhaseCover) {
+        if (r->tickCount % kCoverStepTicks != 0) return;
+        // 每帧重新取一次目标窗口矩形：窗口在这期间被拖动/缩放时，提醒不会停在旧位置上
+        RECT tw;
+        if (GetTargetWindowRect(r->targetWnd, tw)) r->coverTo = tw;
+        double t = (double)(now - r->phaseTick) / (double)kCoverMs;
+        if (t > 1.0) t = 1.0;
+        double e = EaseInOutCubic(t); // 平滑进出、不回弹
+        const RECT& a = r->coverFrom;
+        const RECT& b = r->coverTo;
+        int nx = (int)(a.left   + (b.left   - a.left)   * e + 0.5);
+        int ny = (int)(a.top    + (b.top    - a.top)    * e + 0.5);
+        int nw = (int)((a.right  - a.left) + ((b.right  - b.left) - (a.right - a.left)) * e + 0.5);
+        int nh = (int)((a.bottom - a.top)  + ((b.bottom - b.top)  - (a.bottom - a.top))  * e + 0.5);
+        if (nw < 1) nw = 1;
+        if (nh < 1) nh = 1;
+        r->x = nx;
+        r->y = ny;
+        if (nw != r->w || nh != r->h) {
+            r->w = nw;
+            r->h = nh;
+            EnsureSurface(r, nw, nh);
+            r->dirty = true;
+        }
+        // 图标/文字动画跟着同一条缓动曲线走（与小窗宽高变化完全同步）
+        if (e != r->coverT) {
+            r->coverT = e;
+            r->dirty = true;
+        }
+        // 圆角半径保持恒定：一方面放大过程中尺度变化已经很明显，另一方面角块缓存
+        // 是按下半径缓存的，半径每帧都变会导致每帧重建角块（得不偿失）。
+        if (t >= 1.0) {
+            r->x = b.left;
+            r->y = b.top;
+            StartReminderFade(r, kCoverFadeMs); // 到位后直接渐隐消失
+        }
+        PresentReminder(r);
+        return;
+    }
+
     if (r->phase == kRemPhaseFade) {
-        r->alpha -= 10;
-        if (r->alpha < 0) r->alpha = 0;
-        SetLayeredWindowAttributes(r->hwnd, 0, (BYTE)r->alpha, LWA_ALPHA);
-        if (r->alpha == 0) {
-            KillTimer(r->hwnd, IDT_REMINDER);
+        double t = (double)(now - r->phaseTick) / (double)r->fadeMs;
+        if (t > 1.0) t = 1.0;
+        r->alpha = (int)(r->baseAlpha * (1.0 - t) + 0.5);
+        if (t >= 1.0) {
+            r->alpha = 0;
+            PresentReminder(r);
+            // 还欠着"视觉引导动画"没播（目标窗口迟迟没出现）：先不销毁，
+            // 隐形地继续等目标窗口，窗口一出现就补播这段动画。
+            // 等待总时长以第一次进入等待时算起（waitUntil 只在此处设置一次），
+            // 免得"窗口一闪而过"导致反复等下去。
+            EnterCriticalSection(&g_settingsLock);
+            bool wantCover = g_settings.coverWindow;
+            LeaveCriticalSection(&g_settingsLock);
+            if (wantCover && !r->coverDone) {
+                if (r->waitUntil == 0) {
+                    r->waitUntil = now + kCoverWaitMs;
+                    // 记住隐藏前的位置与弹出方向：补播动画要从原位置原地弹出，
+                    // 不能改用目标窗口的位置（否则看起来就是"错位"）
+                    r->restoreX = r->x;
+                    r->restoreY = r->y;
+                    r->restoreFromBelow = r->popFromBelow;
+                }
+                if (now < r->waitUntil) {
+                    r->phase = kRemPhaseWait;
+                    r->phaseTick = now;
+                    r->tickCount = 0;
+                    r->lastPollTick = 0; // 进入等待后立刻轮询一次
+                    r->lastExeScan = 0;
+                    return;
+                }
+            }
             HWND h = r->hwnd;
             DestroyWindow(h); // WM_NCDESTROY 里 RemoveReminder 回收 r，此后不再访问 r
+            return;
         }
+        PresentReminder(r);
+        return;
+    }
+
+    if (r->phase == kRemPhaseWait) {
+        // 隐形等待目标窗口：一出现就从"隐藏前的原位置"重新弹出，然后接着播覆盖动画
+        if (now - r->lastPollTick < (ULONGLONG)kRemWaitPollMs) return;
+        r->lastPollTick = now;
+        RECT wr;
+        HWND hw = NULL;
+        bool hasWnd = FindVisibleMainWindow(r->targetPid, wr, &hw);
+        if (!hasWnd && now - r->lastExeScan >= (ULONGLONG)kRemExeScanMs) {
+            // 目标进程已退出（存根）时按 exe 找：这条路径要遍历进程，降频到 1 秒一次
+            r->lastExeScan = now;
+            hasWnd = FindWindowByExeName(r->exeName, r->exePath, wr, &hw);
+        }
+        if (hasWnd) {
+            r->targetWnd = hw;
+            r->coverTo = wr;
+            r->pendingCover = true;
+            r->w = OverlayW();
+            r->h = OverlayH();
+            EnsureSurface(r, r->w, r->h);
+            r->dirty = true;
+            // 原地弹出：终点点就是隐藏前那一帧的位置，位移方向也沿用当时的方向
+            r->popFromBelow = r->restoreFromBelow;
+            r->popY1 = r->restoreY;
+            r->popY0 = r->restoreY + (r->popFromBelow ? Sx(kPopOffset) : -Sx(kPopOffset));
+            r->x = r->restoreX;
+            r->y = r->popY0;
+            r->alpha = 0;
+            r->baseAlpha = 255;
+            r->phase = kRemPhasePopIn;
+            r->phaseTick = now;
+            r->shownTick = now;
+            r->tickCount = 0;
+            PresentReminder(r);
+            return;
+        }
+        if (now >= r->waitUntil) { // 等够时间还没出现：安静收掉
+            HWND h = r->hwnd;
+            DestroyWindow(h);
+        }
+        return;
     }
 }
 
-// 弹出（或刷新）一条覆盖层提醒。不同软件各占一条、可同时存在互不影响；
-// 同一软件（同 exe 路径）在上一条还没消失时再次启动，则复用同一条刷新位置与内容。
-static void ShowReminder(DWORD pid, const std::wstring& text, const std::wstring& app,
-                         DWORD timeoutMs, const std::wstring& exePath) {
-    std::wstring key = exePath.empty() ? Lower(app) : Lower(exePath);
-    ReminderInst* r = FindReminderByKey(key);
-    if (r) {
-        if (r->icon) { DestroyIcon(r->icon); r->icon = NULL; }
-    } else {
-        r = CreateReminder();
-        if (!r) return;
+// 取程序图标：优先用 PrivateExtractIconsW 直接取一张较大的图标（小窗里缩到 18px 显示、
+// 视觉引导动画里要放大到几十像素，用 shell 的 32x32 放大会糊），失败再退回 shell 大图标。
+static HICON LoadAppIcon(const std::wstring& path) {
+    if (path.empty()) return NULL;
+    HMODULE u32 = GetModuleHandleW(L"user32.dll");
+    if (u32) {
+        typedef UINT (WINAPI *PFN_PrivateExtractIconsW)(LPCWSTR, int, int, int, HICON*, UINT*, UINT, UINT);
+        PFN_PrivateExtractIconsW f =
+            (PFN_PrivateExtractIconsW)GetProcAddress(u32, "PrivateExtractIconsW");
+        if (f) {
+            int want = Sx(64);
+            if (want < 32) want = 32;
+            HICON ic = NULL;
+            UINT id = 0;
+            if (f(path.c_str(), 0, want, want, &ic, &id, 1, 0) == 1 && ic) return ic;
+        }
     }
+    SHFILEINFOW sfi;
+    ZeroMemory(&sfi, sizeof(sfi));
+    if (SHGetFileInfoW(path.c_str(), FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi),
+                       SHGFI_ICON | SHGFI_LARGEICON))
+        return sfi.hIcon;
+    return NULL;
+}
+
+// 显示一条覆盖层提醒。每个软件最多只占一条：同一条还没消失时再次启动（连点、反复点）
+// 直接忽略，让"最开始那条"继续播完；不同软件各有各的实例，可以同时显示互不影响。
+static void ShowReminder(DWORD pid, const std::wstring& text, const std::wstring& app,
+                         DWORD timeoutMs, const std::wstring& exePath,
+                         const std::wstring& exeName) {
+    std::wstring key = exePath.empty() ? Lower(app) : Lower(exePath);
+    if (FindReminderByKey(key)) return; // 已有该软件的提醒：忽略本次，不重播
+    ReminderInst* r = CreateReminder();
+    if (!r) return;
     ULONGLONG now = GetTickCount64();
     r->key = key;
     r->targetPid = pid;
@@ -1579,39 +2640,64 @@ static void ShowReminder(DWORD pid, const std::wstring& text, const std::wstring
     r->app = app;
     r->timeoutMs = timeoutMs;
     r->shownTick = now;
-    r->alpha = 255;
-    r->phase = kRemPhaseSteady;
     r->tickCount = 0;
     r->anchoredToClick = false;
     r->anchoredToWnd = false;
+    r->targetWnd = NULL;
+    r->baseAlpha = 255;
+    r->fadeMs = kFadeMs;
+    r->radius = Sx(16);
+    r->w = OverlayW();
+    r->h = OverlayH();
+    // 目标 exe（小写）：进程"启动即退出"时靠它继续找真程序的窗口。
+    // 有全路径就优先按全路径精确匹配，避免误认其他目录里的同名程序。
+    r->exeName = Lower(exeName.empty() ? GetFileName(exePath) : exeName);
+    r->exePath = Lower(exePath);
+    r->lastPollTick = 0;
+    r->lastExeScan = 0;
+    r->pendingCover = false;
+    r->coverDone = false;
+    r->waitUntil = 0;
+    r->coverT = 0.0;
 
     // 左侧展示程序的图标：按本次 exe 路径读取
-    if (!exePath.empty()) {
-        SHFILEINFOW sfi;
-        ZeroMemory(&sfi, sizeof(sfi));
-        if (SHGetFileInfoW(exePath.c_str(), FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi),
-                           SHGFI_ICON | SHGFI_SMALLICON))
-            r->icon = sfi.hIcon;
-    }
+    r->icon = LoadAppIcon(exePath);
+    if (r->icon) r->iconBmp = Gdiplus::Bitmap::FromHICON(r->icon);
+    r->dirty = true;
 
-    POINT pt;
-    if (GetLastClickPoint(pt, now)) {
-        // 第①级定位：用户点击位置上方
-        r->anchoredToClick = true;
-        PositionReminder(r, pt);
+    // 落点：① 用户点击位置上方；③ 兜底为屏幕底部中央（主窗口出现后交给定时器重定位）
+    POINT anchor;
+    bool placedBelow = false;
+    if (GetLastClickPoint(anchor, now)) {
+        r->anchoredToClick = true; // 第①级定位
     } else {
-        // 第③级定位（兜底）：屏幕底部中央；主窗口出现后由定时器接管重定位
         MONITORINFO mi;
         mi.cbSize = sizeof(mi);
         HMONITOR mon = MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
         GetMonitorInfoW(mon, &mi);
-        POINT anchor = { (mi.rcWork.left + mi.rcWork.right) / 2,
-                         mi.rcWork.bottom - OverlayH() - Sx(60) };
-        PositionReminder(r, anchor);
+        anchor.x = (mi.rcWork.left + mi.rcWork.right) / 2;
+        anchor.y = mi.rcWork.bottom - OverlayH() - Sx(60);
     }
-    SetLayeredWindowAttributes(r->hwnd, 0, 255, LWA_ALPHA);
-    ShowWindow(r->hwnd, SW_SHOW);
-    SetTimer(r->hwnd, IDT_REMINDER, 50, NULL);
+    RECT rc = ComputeReminderRect(anchor, r->w, r->h, placedBelow);
+
+    // ② 弹出动画：默认从下往上滑入（起点比终点低 20px），
+    //    只有在"点击位置贴着屏幕顶部、提醒被放到锚点下方"时才改成从上往下滑，
+    //    否则向上滑会滑出屏幕外。
+    EnsureSurface(r, r->w, r->h);
+    r->popFromBelow = !placedBelow;
+    r->popY1 = rc.top;
+    r->popY0 = rc.top + (r->popFromBelow ? Sx(kPopOffset) : -Sx(kPopOffset));
+    r->x = rc.left;
+    r->y = r->popY0;
+    r->alpha = 0;
+    r->phase = kRemPhasePopIn;
+    r->phaseTick = now;
+
+    // 逐像素 alpha 的窗口：先把第一帧（半透明、alpha=0）送到屏幕上再显示，
+    // 避免先显示出一个系统底色的空窗口
+    PresentReminder(r);
+    ShowWindow(r->hwnd, SW_SHOWNA);
+    AnimClockArm(); // 交给动画时钟按 ~16ms 推进（弹出/覆盖/渐隐都在里面）
 }
 
 // 低层鼠标钩子：记录最近一次左键点击（供覆盖层第①级定位）
@@ -1647,6 +2733,12 @@ static LRESULT CALLBACK TrayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         AddTrayIcon();
         return 0;
     }
+    // 系统切换浅色/深色（lParam 为 "ImmersiveColorSet"）：设置界面与提醒卡片一起跟着换
+    if (msg == WM_SETTINGCHANGE && lp && !IsBadStringPtrW((LPCWSTR)lp, 64) &&
+        _wcsicmp((const wchar_t*)lp, L"ImmersiveColorSet") == 0) {
+        OnSystemThemeMaybeChanged();
+        return 0;
+    }
     switch (msg) {
     case WM_TRAYICON: {
         // 真实托盘回调的 lParam 高 16 位可能带标志（如 0x00010202），
@@ -1660,14 +2752,24 @@ static LRESULT CALLBACK TrayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     }
     case WM_BLOCKED: {
-        // 拦截到重复启动：记录显示名，重置去抖定时器，把一次爆发合并成一条通知
+        // 拦截到重复启动：第一次拦下就立刻弹气泡（原来要等连点结束、防抖 700ms 才弹，
+        // 通知会迟到，且显示的是最后一次点击的软件名）。
+        // 同一波连点（落在判定时间窗口内）只弹一条，避免连点刷屏。
         LaunchEvent* e = (LaunchEvent*)lp;
         if (e) {
-            g_pendingBlockApp = GetAppDisplayName(e->pid, e->path, e->exe);
+            ULONGLONG now = GetTickCount64();
+            DWORD gap = GetDupWindowMs();
+            if (g_lastBlockBalloonTick == 0 || now - g_lastBlockBalloonTick >= (ULONGLONG)gap) {
+                g_lastBlockBalloonTick = now;
+                std::wstring app = GetAppDisplayName(e->pid, e->path, e->exe);
+                std::wstring titleFmt, contentFmt;
+                GetFormats(titleFmt, contentFmt);
+                std::wstring title   = ReplaceTokens(titleFmt, app);
+                std::wstring content = ConvertEscapes(ReplaceTokens(contentFmt, app));
+                ShowBalloon(title.c_str(), content.c_str());
+            }
             delete e;
         }
-        if (g_debounceTimer) KillTimer(hwnd, g_debounceTimer);
-        g_debounceTimer = (UINT)SetTimer(hwnd, IDT_DEBOUNCE, 700, NULL);
         return 0;
     }
     case WM_REMINDER: {
@@ -1684,7 +2786,7 @@ static LRESULT CALLBACK TrayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 std::wstring txt = ReplaceTokens(contentFmt, app);
                 // 覆盖层左侧要显示程序图标，需要给到进程的 exe 路径
                 std::wstring iconPath = e->path.empty() ? QueryProcPath(e->pid) : e->path;
-                ShowReminder(e->pid, ConvertEscapes(txt), app, to, iconPath);
+                ShowReminder(e->pid, ConvertEscapes(txt), app, to, iconPath, e->exe);
             }
             delete e;
         }
@@ -1694,17 +2796,7 @@ static LRESULT CALLBACK TrayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetTimer(hwnd, IDT_STARTUP, 1500, NULL); // 稍作延迟，避免刚启动系统未就绪时气泡被吞
         return 0;
     case WM_TIMER:
-        if (wp == IDT_DEBOUNCE) {
-            if (g_debounceTimer) {
-                KillTimer(hwnd, g_debounceTimer);
-                g_debounceTimer = 0;
-            }
-            std::wstring titleFmt, contentFmt;
-            GetFormats(titleFmt, contentFmt);
-            std::wstring title   = ReplaceTokens(titleFmt, g_pendingBlockApp);
-            std::wstring content = ConvertEscapes(ReplaceTokens(contentFmt, g_pendingBlockApp));
-            ShowBalloon(title.c_str(), content.c_str());
-        } else if (wp == IDT_STARTUP) {
+        if (wp == IDT_STARTUP) {
             KillTimer(hwnd, IDT_STARTUP);
             ShowBalloon(L"SingleStart 已启动",
                         L"SingleStart 正在后台运行。");
@@ -1780,6 +2872,7 @@ static DWORD WINAPI MonitorThread(LPVOID) {
         EnterCriticalSection(&g_settingsLock);
         bool blockDup    = g_settings.blockDup;    // 拦截重复启动开关（false 时不杀第二实例）
         bool blockNotify = g_settings.blockNotify; // 拦截到重复启动时气泡通知开关
+        DWORD dupWindow  = g_settings.dupWindowMs; // 重复启动判定时间窗口（毫秒，设置里可调）
         LeaveCriticalSection(&g_settingsLock);
 
         for (auto& kv : cur) {
@@ -1826,7 +2919,7 @@ static DWORD WINAPI MonitorThread(LPVOID) {
             auto it = lastLaunch.find(key);
             ULONGLONG last = (it != lastLaunch.end()) ? it->second : 0;
 
-            if (last != 0 && (now - last) <= kDupWindowMs) {
+            if (last != 0 && (now - last) <= dupWindow) {
                 // 强保证"至少一个存活"：杀新进程前先确认还有同名实例在运行。
                 // 若原实例已退出（关闭窗口 / 崩溃 / 存根已转交），则放行本次启动，
                 // 让它成为存活的实例，避免"拦截后一个都不剩"。
@@ -1854,7 +2947,7 @@ static DWORD WINAPI MonitorThread(LPVOID) {
 
         // 清理过期的启动记录（保留 2 倍窗口，给“启动即退出”的存根留出识别余地）
         for (auto it = lastLaunch.begin(); it != lastLaunch.end();) {
-            if (now - it->second > (ULONGLONG)kDupWindowMs * 2) it = lastLaunch.erase(it);
+            if (now - it->second > (ULONGLONG)dupWindow * 2) it = lastLaunch.erase(it);
             else ++it;
         }
         prev = cur;
@@ -1874,6 +2967,17 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         ReleaseDC(NULL, sdc);
         if (dpi <= 0) dpi = 96;
         g_dpiScale = dpi / 96.0;
+    }
+
+    // 深色模式支持（uxtheme 深色接口 + 系统当前明暗），要在建窗口前准备好
+    InitDarkModeSupport();
+    BuildUiTheme();
+
+    // GDI+：覆盖层提醒的圆角/文字/图标都靠它做抗锯齿
+    ULONG_PTR gdipToken = 0;
+    {
+        Gdiplus::GdiplusStartupInput gdipInput;
+        Gdiplus::GdiplusStartup(&gdipToken, &gdipInput, NULL);
     }
 
     // 启用 ComCtl32 v6 视觉样式（现代按钮/编辑框外观；需配合 app.manifest 声明 v6 依赖）
@@ -1933,16 +3037,47 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     }
     CloseHandle(hThread); // 线程持续运行，句柄无需保留
 
+    AnimClockInit(); // 动画时钟（有提醒显示时才武装，平时完全静默）
+
+    // 消息循环：同时等"动画时钟"和"窗口消息"。动画时钟到点就推进一帧提醒动画，
+    // 这样动画节奏由高精度可等待定时器决定，不受 SetTimer 的系统粒度/定时器合并影响。
     MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+    ZeroMemory(&msg, sizeof(msg));
+    int exitCode = 0;
+    for (;;) {
+        // 正常情况下等"动画时钟 + 窗口消息"；万一系统连可等待定时器都建不出来，
+        // 就退化成"动画期间 16ms 超时轮询"，功能不受影响。
+        DWORD waitCount = g_animTimer ? 1 : 0;
+        HANDLE* waitHandles = g_animTimer ? &g_animTimer : NULL;
+        DWORD timeout = INFINITE;
+        if (!g_animTimer && InterlockedCompareExchange(&g_animActive, 0, 0) != 0)
+            timeout = (DWORD)(g_animPeriodMs > 0 ? g_animPeriodMs : kRemTimerMs);
+        DWORD w = MsgWaitForMultipleObjectsEx(waitCount, waitHandles, timeout, QS_ALLINPUT,
+                                              MWMO_INPUTAVAILABLE);
+        bool animTick = g_animTimer ? (w == WAIT_OBJECT_0) : (w == WAIT_TIMEOUT);
+        if (animTick) { // 动画帧
+            if (InterlockedCompareExchange(&g_animActive, 0, 0) != 0) ReminderTickAll();
+            continue;
+        }
+        if (w == (g_animTimer ? WAIT_OBJECT_0 + 1 : WAIT_OBJECT_0)) { // 有窗口消息
+            bool quit = false;
+            while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_QUIT) { quit = true; break; }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            if (quit) { exitCode = (int)msg.wParam; break; }
+            continue;
+        }
+        break; // 等待失败（极少见），直接退出循环
     }
 
     RemoveTrayIcon();
     if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
+    if (g_animTimer) { CancelWaitableTimer(g_animTimer); CloseHandle(g_animTimer); g_animTimer = NULL; }
     CloseHandle(hMutex);
     if (g_settingsPage) SaveSettings(); // 设置窗口还开着时，退出前把改动落盘
     if (g_settingsWnd) DestroyWindow(g_settingsWnd);
-    return (int)msg.wParam;
+    if (gdipToken) Gdiplus::GdiplusShutdown(gdipToken);
+    return exitCode;
 }
