@@ -2,10 +2,12 @@
 // 由 HelaRoro 和 DeepSeek V4 Flash 共同开发
 1 ICON "app.ico"
 1 24 "app.manifest"
+// 设置页底部的 "Vetted AI Use" 标识（PNG 原样嵌入，运行时用 GDI+ 解码）
+200 RCDATA "AI_Used.png"
 
 1 VERSIONINFO
-FILEVERSION 26,10,0,0
-PRODUCTVERSION 26,10,0,0
+FILEVERSION 26,11,0,0
+PRODUCTVERSION 26,11,0,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -18,11 +20,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "HelaRoro"
             VALUE "FileDescription", "SingleStart"
-            VALUE "FileVersion", "26.10"
+            VALUE "FileVersion", "26.11"
             VALUE "InternalName", "SingleStart"
             VALUE "OriginalFilename", "SingleStart.exe"
             VALUE "ProductName", "SingleStart"
-            VALUE "ProductVersion", "26.10"
+            VALUE "ProductVersion", "26.11"
         END
     END
     BLOCK "VarFileInfo"

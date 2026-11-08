@@ -31,6 +31,7 @@
 #include <winver.h>    // GetFileVersionInfo 系列（读取软件名 FileDescription）
 #include <dwmapi.h>    // DWMWA_CLOAKED（覆盖层主窗口检测）/ 系统背景材质
 #include <uxtheme.h>   // SetWindowTheme（设置界面深色模式）
+#include <vsstyle.h>   // BP_RADIOBUTTON / RBS_*（自绘单选按钮时用系统主题画圆点）
 #include <objidl.h>    // GDI+ 需要 IStream
 #include <gdiplus.h>   // 覆盖层抗锯齿绘制（圆角、文字、图标）
 #include <mmsystem.h>  // timeBeginPeriod：动画期间提高定时器精度，否则 16ms 定时器实际约 31ms
@@ -51,6 +52,7 @@ static const wchar_t* kMutexName      = L"Local\\SingleStart_SingleInstance";
 static const wchar_t* kTrayWndClass   = L"SingleStart_TrayWndClass";
 static const wchar_t* kSettingsClass  = L"SingleStart_SettingsWndClass";
 static const wchar_t* kPageClass      = L"SingleStart_SettingsPageClass";
+static const wchar_t* kAboutClass     = L"SingleStart_AboutWndClass";
 static const wchar_t* kSettingsTitle  = L"SingleStart 设置";
 static const wchar_t* kRegRoot        = L"Software\\HelaRoro\\SingleStart";
 static const wchar_t* kRunKey         = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -105,10 +107,16 @@ static const DWORD kPollIntervalMax = 2000;      // 可设置的上限：数值�
 // 间隔必须足够小，才能捕捉"重复启动后自己很快退出的第二实例"
 // （例如 TIM、QQ 自带单实例检测，连点时第二个进程存活不足 150ms，间隔太大时会漏掉）
 
+// 运行模式：轮询（默认，兼容旧版）或窗口事件（实验性，空闲时不占 CPU）。
+// 窗口事件模式依赖系统广播的顶层窗口显示事件，看不到完全不创建窗口的进程。
+static const DWORD kRunModePolling = 0;
+static const DWORD kRunModeEvent   = 1;
+
 #define WM_TRAYICON   (WM_APP + 1)
 #define WM_BLOCKED    (WM_APP + 2)  // 监控线程：拦截到一次重复启动
 #define WM_REMINDER   (WM_APP + 3)  // 监控线程：检测到软件启动（无论是否拦截），显示覆盖层提醒
 #define WM_SHOW_STARTUP (WM_APP + 4) // 启动时通知
+#define WM_MONITOR_SWITCH (WM_APP + 5) // 投递给监控线程：运行模式变了，重新读取设置
 #define IDT_STARTUP   3
 #define IDT_THEME     5
 
@@ -122,7 +130,6 @@ static const DWORD kPollIntervalMax = 2000;      // 可设置的上限：数值�
 #define IDC_WL_EDIT      104  // 已弃用：白名单改用列表 IDC_WL_LIST
 #define IDC_SAVE_BTN     105  // 已弃用：改为改动即自动保存
 #define IDC_EXIT_BTN     106
-#define IDC_STATUS       107
 #define IDC_POLL_EDIT    108  // 进程扫描间隔（毫秒）
 #define IDC_RESTORE_BTN  109  // 还原默认设置
 #define IDC_STARTUP_NOTIFY   110 // 启动时通知
@@ -135,6 +142,17 @@ static const DWORD kPollIntervalMax = 2000;      // 可设置的上限：数值�
 #define IDC_BLOCK_NOTIFY     117 // 拦截到重复启动时气泡通知
 #define IDC_COVER_WINDOW     118 // 视觉引导动画：提醒移动到目标软件窗口并覆盖（依赖"其他软件启动时提醒"）
 #define IDC_DUP_WINDOW_EDIT  119 // 重复启动判定时间（毫秒）
+#define IDC_RUN_MODE_POLL    121 // 运行模式：轮询（默认）
+#define IDC_RUN_MODE_EVENT   122 // 运行模式：窗口事件（experimental）
+#define IDC_ABOUT_BTN        123 // 设置页最底部：关于
+#define IDR_AI_BADGE         200 // 资源：AI_Used.png（app.rc 里以 RCDATA 嵌入）
+// 关于窗口控件
+#define IDC_ABOUT_TEXT       160
+#define IDC_ABOUT_GITHUB     161
+#define IDC_ABOUT_FORUM_USER 162
+#define IDC_ABOUT_FORUM      163
+#define IDC_ABOUT_CLOSE      164
+#define IDC_ABOUT_BADGE      165
 // 分组标题（纯文字 STATIC，用正常文字色，与灰色说明文字区分开）；区间用于 WM_CTLCOLORSTATIC 判断
 #define IDC_SEC_FIRST        130
 #define IDC_SEC_STARTUP      130 // 启动与通知
@@ -142,7 +160,8 @@ static const DWORD kPollIntervalMax = 2000;      // 可设置的上限：数值�
 #define IDC_SEC_BLOCK        132 // 重复启动拦截
 #define IDC_SEC_WHITELIST    133 // 白名单
 #define IDC_SEC_OTHER        134 // 其他
-#define IDC_SEC_LAST         134
+#define IDC_SEC_EXPERIMENTAL 135 // 实验性选项
+#define IDC_SEC_LAST         135
 
 // ---------------------------------------------------------------- 全局状态
 
@@ -154,6 +173,8 @@ static HICON     g_icon          = NULL;
 static bool      g_trayAdded     = false;
 static UINT      g_msgTaskbarCreated = 0; // 资源管理器重启通知（TaskbarCreated 广播）
 static ULONGLONG g_lastBlockBalloonTick = 0; // 上一次"拦截气泡"的时间：同一波连点只弹一条通知
+static volatile LONG g_eventModeFailed = 0;  // 窗口事件钩子创建失败：本会话退回轮询
+static HANDLE g_monitorWake = NULL;          // 自动复位事件：唤醒轮询循环立即扫描/重读运行模式
 static const GUID kIconGuid =
     { 0x7a2f5b3c, 0x1e4d, 0x4f6a, { 0x9b, 0x8c, 0x3d, 0x2e, 0x1f, 0x0a, 0x5b, 0x6c } };
 
@@ -181,6 +202,7 @@ struct Settings {
     bool  blockNotify    = true;   // 拦截到重复启动时气泡通知（默认开启）
     bool  coverWindow    = false;  // 目标软件窗口出现后，提醒移动到该窗口并覆盖（默认关闭）
     DWORD dupWindowMs = kDefaultDupWindowMs; // 重复启动判定时间（毫秒），监控线程每轮读取
+    DWORD runMode = kRunModePolling; // 运行模式：0=轮询（默认），1=窗口事件（实验性）
     std::wstring reminderContent;  // 提醒内容模板（默认与通知标题一致）
     DWORD reminderTimeoutMs = kDefaultReminderTimeout; // 提醒显示时长（毫秒）
 };
@@ -201,6 +223,9 @@ static HHOOK g_mouseHook = NULL;
 static POINT g_lastClick = { -1, -1 };
 static ULONGLONG g_lastClickTick = 0;
 static bool g_hasClick = false;
+// 最近一次"可能拉起新程序"的点击（任务栏/桌面/开始菜单/资源管理器）：
+// 轮询模式据此在点击后的 2 秒内临时提高扫描频率，抓住启动即退出的存根；空闲时仍按用户设置的间隔。
+static volatile DWORD g_shellClickTick = 0;
 
 // ---------------------------------------------------------------- 深色模式（跟随系统）
 // 系统"应用模式"开关保存在 HKCU\...\Themes\Personalize\AppsUseLightTheme（0=深色，1=浅色）。
@@ -229,6 +254,66 @@ static bool    g_uiDarkBuilt = false;
 
 static void ApplySettingsTheme(HWND hwnd);
 static void RefreshReminderTheme();
+
+// 设置页底部的标识图（嵌在资源里的 PNG，运行时用 GDI+ 解码；透明圆角靠绘制时填底色处理）
+static Gdiplus::Bitmap* g_aiBadge = NULL;
+
+// 从 RCDATA 资源读 PNG 并交给 GDI+ 解码（调用前 GDI+ 必须已 GdiplusStartup）
+static Gdiplus::Bitmap* LoadPngResource(int id) {
+    HRSRC hr = FindResourceW(g_hInst, MAKEINTRESOURCEW(id), RT_RCDATA);
+    if (!hr) return NULL;
+    DWORD sz = SizeofResource(g_hInst, hr);
+    HGLOBAL res = LoadResource(g_hInst, hr);
+    void* src = res ? LockResource(res) : NULL;
+    if (!src || !sz) return NULL;
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, sz);
+    if (!mem) return NULL;
+    void* dst = GlobalLock(mem);
+    if (!dst) { GlobalFree(mem); return NULL; }
+    memcpy(dst, src, sz);
+    GlobalUnlock(mem);
+    IStream* st = NULL;
+    if (FAILED(CreateStreamOnHGlobal(mem, TRUE, &st)) || !st) { GlobalFree(mem); return NULL; }
+    Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromStream(st);
+    st->Release();
+    if (bmp && bmp->GetLastStatus() != Gdiplus::Ok) { delete bmp; bmp = NULL; }
+    return bmp;
+}
+
+// 用系统主题画单选圆点（保持系统样式）；主题取不到时退回 DrawFrameControl 的系统样式
+static void DrawRadioDot(HWND ctl, HDC hdc, int x, int y, int d, bool checked) {
+    RECT rc = { x, y, x + d, y + d };
+    HTHEME th = OpenThemeData(ctl, L"Button");
+    if (th) {
+        HRESULT hr = DrawThemeBackground(th, hdc, BP_RADIOBUTTON,
+                                         checked ? RBS_CHECKEDNORMAL : RBS_UNCHECKEDNORMAL,
+                                         &rc, NULL);
+        CloseThemeData(th);
+        if (SUCCEEDED(hr)) return;
+    }
+    UINT st = DFCS_BUTTONRADIO | (checked ? DFCS_CHECKED : 0);
+    DrawFrameControl(hdc, &rc, DFC_BUTTON, st);
+}
+
+// 把 AI 使用标识等比缩放、居中画进指定矩形（调用方负责先铺好底色）
+static void DrawAiBadgeImage(HDC hdc, const RECT& rc) {
+    if (!g_aiBadge || rc.right <= rc.left || rc.bottom <= rc.top) return;
+    double sw = (double)g_aiBadge->GetWidth();
+    double sh = (double)g_aiBadge->GetHeight();
+    if (sw <= 0.0 || sh <= 0.0) return;
+    int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+    double s = cw / sw < ch / sh ? cw / sw : ch / sh;
+    int dw = (int)(sw * s + 0.5), dh = (int)(sh * s + 0.5);
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    int dx = rc.left + (cw - dw) / 2;
+    int dy = rc.top + (ch - dh) / 2;
+    Gdiplus::Graphics g(hdc);
+    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    g.DrawImage(g_aiBadge, Gdiplus::Rect(dx, dy, dw, dh));
+}
 
 // GetVersionEx 会被兼容性清单改写，这里改用 ntdll!RtlGetVersion 取真实版本号
 static DWORD GetWindowsBuild() {
@@ -720,6 +805,9 @@ static void LoadSettings() {
     if (dw < kDupWindowMin) dw = kDupWindowMin;
     if (dw > kDupWindowMax) dw = kDupWindowMax;
     g_settings.dupWindowMs = dw;
+    // 运行模式：默认轮询；旧版本没有该键，读不到时按默认处理
+    DWORD rm = RegGetDword(L"RunMode", kRunModePolling);
+    g_settings.runMode = (rm == kRunModeEvent) ? kRunModeEvent : kRunModePolling;
     // 提醒内容与通知标题是两个独立字段：默认值取 kDefaultTitle。
     // （旧行为是“留空则跟随通知标题”，但改动即自动保存会把标题固化进本字段，
     //   之后改标题不再影响提醒文案，反而不易理解，故改为独立默认值。）
@@ -751,6 +839,15 @@ static DWORD GetDupWindowMs() {
     if (v < kDupWindowMin) v = kDupWindowMin;
     if (v > kDupWindowMax) v = kDupWindowMax;
     return v;
+}
+
+// 当前运行模式。窗口事件钩子创建失败时本会话退回轮询（见 g_eventModeFailed）
+static DWORD GetRunMode() {
+    EnterCriticalSection(&g_settingsLock);
+    DWORD m = g_settings.runMode;
+    LeaveCriticalSection(&g_settingsLock);
+    if (InterlockedCompareExchange(&g_eventModeFailed, 0, 0) != 0) return kRunModePolling;
+    return (m == kRunModeEvent) ? kRunModeEvent : kRunModePolling;
 }
 
 // 通知标题/内容模板（托盘线程弹通知时读取；与 WinUI 版 SettingsManager.Formats() 对应）
@@ -893,6 +990,8 @@ static LRESULT CALLBACK ReminderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 struct ReminderInst;
 static void ReminderTimerTick(ReminderInst* r);
 static void SubclassWhitelistList(HWND wlList);
+static void ShowAboutDialog(HWND owner);
+static void WakeMonitor();
 
 static void RegisterTrayClass() {
     WNDCLASSEXW wc;
@@ -957,12 +1056,6 @@ static void ShowStartupError(const std::wstring& msg) {
 
 // ---------------------------------------------------------------- 设置窗口
 
-static void SetStatus(const std::wstring& text) {
-    if (!g_settingsPage) return;
-    HWND s = GetDlgItem(g_settingsPage, IDC_STATUS);
-    if (s) SetWindowTextW(s, text.c_str());
-}
-
 static void SaveSettings() {
     if (!g_settingsPage) return;
     wchar_t buf[4096];
@@ -1005,6 +1098,8 @@ static void SaveSettings() {
     bool blockNotify    = IsDlgButtonChecked(g_settingsPage, IDC_BLOCK_NOTIFY) == BST_CHECKED;
     // 覆盖开关被禁用（没开提醒）时也照读照存，重新开启提醒后不会丢
     bool coverWindow    = IsDlgButtonChecked(g_settingsPage, IDC_COVER_WINDOW) == BST_CHECKED;
+    // 运行模式：点击时已即时写入 g_settings.runMode（自绘按钮不保存勾选状态）
+    DWORD runMode = g_settings.runMode;
     // 重复启动判定时间：读输入框并夹到合法范围（夹取后写回界面，避免显示值与生效值不一致）
     BOOL okDup = FALSE;
     DWORD dupWindow = GetDlgItemInt(g_settingsPage, IDC_DUP_WINDOW_EDIT, &okDup, FALSE);
@@ -1036,6 +1131,7 @@ static void SaveSettings() {
     g_settings.blockNotify       = blockNotify;
     g_settings.coverWindow       = coverWindow;
     g_settings.dupWindowMs       = dupWindow;
+    g_settings.runMode           = runMode;
     g_settings.reminderContent   = reminderContent;
     g_settings.reminderTimeoutMs = reminderTimeout;
     LeaveCriticalSection(&g_settingsLock);
@@ -1050,13 +1146,12 @@ static void SaveSettings() {
     RegSetDword(L"BlockNotify", blockNotify ? 1 : 0);
     RegSetDword(L"CoverWindow", coverWindow ? 1 : 0);
     RegSetDword(L"DupWindowMs", dupWindow);
+    RegSetDword(L"RunMode", runMode);
     RegSetString(L"ReminderContent", reminderContent.c_str());
     RegSetDword(L"ReminderTimeoutMs", reminderTimeout);
 
     // 应用开机自启（与 WinUI 版一致：统一在保存时应用，而非勾选时立即执行）
     ApplyAutoStart(IsDlgButtonChecked(g_settingsPage, IDC_AUTOSTART) == BST_CHECKED);
-
-    SetStatus(L"已保存");
 }
 
 // 保存时机：关闭设置窗口（X / Alt+F4）时保存一次，退出软件时再补一次。
@@ -1079,6 +1174,7 @@ static void RestoreDefaults(HWND hwnd) {
     g_settings.blockNotify       = true;   // 拦截到重复启动时气泡通知默认开启
     g_settings.coverWindow       = false;  // 覆盖目标窗口是新功能，默认关闭
     g_settings.dupWindowMs       = kDefaultDupWindowMs;
+    g_settings.runMode           = kRunModePolling; // 运行模式默认轮询
     g_settings.reminderContent   = kDefaultTitle; // 提醒内容有自己的默认值，不跟随通知标题
     g_settings.reminderTimeoutMs = kDefaultReminderTimeout;
     LeaveCriticalSection(&g_settingsLock);
@@ -1093,6 +1189,7 @@ static void RestoreDefaults(HWND hwnd) {
     RegSetDword(L"BlockNotify", 1);
     RegSetDword(L"CoverWindow", 0);
     RegSetDword(L"DupWindowMs", kDefaultDupWindowMs);
+    RegSetDword(L"RunMode", kRunModePolling);
     RegSetString(L"ReminderContent", kDefaultTitle);
     RegSetDword(L"ReminderTimeoutMs", kDefaultReminderTimeout);
     ApplyAutoStart(false);
@@ -1111,17 +1208,20 @@ static void RestoreDefaults(HWND hwnd) {
     CheckDlgButton(g_settingsPage, IDC_BLOCK_DUP, BST_CHECKED); // 拦截重复启动默认开启
     CheckDlgButton(g_settingsPage, IDC_BLOCK_NOTIFY, BST_CHECKED); // 拦截到重复启动时气泡通知默认开启
     CheckDlgButton(g_settingsPage, IDC_COVER_WINDOW, BST_UNCHECKED); // 覆盖目标窗口默认关闭
+    InvalidateRect(GetDlgItem(g_settingsPage, IDC_RUN_MODE_POLL), NULL, TRUE);
+    InvalidateRect(GetDlgItem(g_settingsPage, IDC_RUN_MODE_EVENT), NULL, TRUE);
     EnableWindow(GetDlgItem(g_settingsPage, IDC_REMINDER_EDIT), TRUE);
     EnableWindow(GetDlgItem(g_settingsPage, IDC_REMINDER_TIMEOUT_EDIT), TRUE);
     EnableWindow(GetDlgItem(g_settingsPage, IDC_COVER_WINDOW), TRUE); // 提醒默认开启，故覆盖开关可用
     EnableWindow(GetDlgItem(g_settingsPage, IDC_BLOCK_NOTIFY), TRUE); // 拦截与气泡通知默认均开启
     EnableWindow(GetDlgItem(g_settingsPage, IDC_DUP_WINDOW_EDIT), TRUE); // 拦截默认开启，故判定时间可编辑
+    EnableWindow(GetDlgItem(g_settingsPage, IDC_POLL_EDIT), TRUE); // 运行模式默认轮询，扫描间隔可编辑
     EnableWindow(GetDlgItem(g_settingsPage, IDC_TITLE_EDIT), TRUE);
     EnableWindow(GetDlgItem(g_settingsPage, IDC_CONTENT_EDIT), TRUE);
 
-    // 还原后立即落盘，避免用户以为已生效、实际还停在旧设置上；状态提示随后覆盖为“已还原”。
+    // 还原后立即落盘，避免用户以为已生效、实际还停在旧设置上。
     SaveSettings();
-    SetStatus(L"已还原默认设置");
+    WakeMonitor(); // 运行模式可能从窗口事件切回轮询，通知监控线程
 }
 
 // 页面滚动：把整页子窗口按当前滚动位置摆放
@@ -1205,7 +1305,10 @@ static LRESULT CALLBACK PageProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return (LRESULT)g_ui.brField;
     }
     case WM_CTLCOLORBTN: {
+        // 复选框/单选按钮的文字颜色由这里决定；深色模式下必须显式设成浅色，
+        // 否则系统按默认黑字绘制，落在深色背景上几乎看不清。
         HDC hdc = (HDC)wp;
+        SetTextColor(hdc, g_ui.text);
         SetBkColor(hdc, g_ui.pageBg);
         return (LRESULT)g_ui.brPage;
     }
@@ -1317,12 +1420,25 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         // 进程扫描间隔
         mkCtl(L"STATIC", L"进程扫描间隔（毫秒）", 0, 20, NULL, kPageIndent, 4);
         mkCtl(L"EDIT", L"100", ES_AUTOHSCROLL | ES_NUMBER, 26, (HMENU)IDC_POLL_EDIT, kPageIndent, 18);
-        // 按钮（每个独占一行，与输入框/列表同宽）。没有“保存”按钮：关闭设置窗口时保存。
-        mkCtl(L"BUTTON", L"退出软件", BS_PUSHBUTTON, 30, (HMENU)IDC_EXIT_BTN, kPageIndent, 10);
-        mkCtl(L"BUTTON", L"还原默认设置", BS_PUSHBUTTON, 30, (HMENU)IDC_RESTORE_BTN, kPageIndent, 20);
 
-        // 状态提示（最后一行）
-        mkCtl(L"STATIC", L"", 0, 20, (HMENU)IDC_STATUS, 0, 8);
+        // ---- 实验性选项（运行模式：轮询为默认，窗口事件为实验特性）
+        secTitle(L"实验性选项", (HMENU)IDC_SEC_EXPERIMENTAL);
+        secLine();
+        mkCtl(L"STATIC", L"运行模式", 0, 20, NULL, kPageIndent, 4);
+        // 自绘按钮：圆点用系统主题的 BP_RADIOBUTTON 绘制（保持系统样式），
+        // 文字用当前主题文字色单独绘制（深色模式下不会变成黑字）。
+        // 选中项以 g_settings.runMode 为准，由 WM_COMMAND 按点击的控件切换。
+        // 轮询兼容性最好（能抓到启动即退出的存根）；窗口事件空闲时不占 CPU。
+        mkCtl(L"BUTTON", L"轮询（默认）", BS_OWNERDRAW, 24,
+              (HMENU)IDC_RUN_MODE_POLL, kPageIndent, 6);
+        mkCtl(L"BUTTON", L"窗口事件 (experimental)", BS_OWNERDRAW, 24,
+              (HMENU)IDC_RUN_MODE_EVENT, kPageIndent, 18);
+
+        // 关于，以及排在它下方的操作按钮（每个独占一行，与输入框/列表同宽）。
+        // 没有“保存”按钮：关闭设置窗口时保存。
+        mkCtl(L"BUTTON", L"关于", BS_PUSHBUTTON, 30, (HMENU)IDC_ABOUT_BTN, kPageIndent, 10);
+        mkCtl(L"BUTTON", L"退出软件", BS_PUSHBUTTON, 30, (HMENU)IDC_EXIT_BTN, kPageIndent, 10);
+        mkCtl(L"BUTTON", L"还原默认设置", BS_PUSHBUTTON, 30, (HMENU)IDC_RESTORE_BTN, kPageIndent, 8);
 
         LayoutPage(hwnd);
 
@@ -1350,6 +1466,8 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         // 拦截关闭时，"拦截气泡通知"选项、判定时间及标题/内容一并禁用
         EnableWindow(GetDlgItem(page, IDC_BLOCK_NOTIFY), g_settings.blockDup);
         EnableWindow(GetDlgItem(page, IDC_DUP_WINDOW_EDIT), g_settings.blockDup);
+        // 扫描间隔只对轮询模式有意义；窗口事件模式空闲不扫描，置灰避免误解
+        EnableWindow(GetDlgItem(page, IDC_POLL_EDIT), g_settings.runMode == kRunModePolling);
         EnableWindow(GetDlgItem(page, IDC_TITLE_EDIT), g_settings.blockDup && g_settings.blockNotify);
         EnableWindow(GetDlgItem(page, IDC_CONTENT_EDIT), g_settings.blockDup && g_settings.blockNotify);
         // 跟随系统明暗（深色时把标准控件一起换成深色主题）
@@ -1448,12 +1566,35 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     case WM_DRAWITEM: {
         LPDRAWITEMSTRUCT dis = (LPDRAWITEMSTRUCT)lp;
         if (dis->CtlType == ODT_STATIC) {
-            // 分组分割线：先铺页面底色（避免滚动时留下残影），再在竖直中线画一条 1px 细线
             RECT rc = dis->rcItem;
+            // 先铺页面底色：透明 PNG 的圆角靠它透出正确的明暗底色，滚动时也不留残影
             FillRect(dis->hDC, &rc, g_ui.brPage);
+            // 自绘 STATIC 是分组分割线：在竖直中线画一条 1px 细线
             int y = rc.top + (rc.bottom - rc.top) / 2;
             RECT line = { rc.left, y, rc.right, y + 1 };
             FillRect(dis->hDC, &line, g_ui.brSep);
+            return TRUE;
+        }
+        // 自绘单选按钮：圆点交给系统主题绘制，文字使用当前主题文字色
+        if (dis->CtlType == ODT_BUTTON &&
+            (dis->CtlID == IDC_RUN_MODE_POLL || dis->CtlID == IDC_RUN_MODE_EVENT)) {
+            HDC hdc = dis->hDC;
+            RECT rc = dis->rcItem;
+            FillRect(hdc, &rc, g_ui.brPage);
+            bool checked = (dis->CtlID == IDC_RUN_MODE_EVENT)
+                           ? (g_settings.runMode == kRunModeEvent)
+                           : (g_settings.runMode != kRunModeEvent);
+            const int d = Sx(14);
+            int x = rc.left + Sx(2);
+            int y = rc.top + ((rc.bottom - rc.top) - d) / 2;
+            DrawRadioDot(dis->hwndItem, hdc, x, y, d, checked);
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, g_ui.text);
+            wchar_t text[128] = { 0 };
+            GetWindowTextW(dis->hwndItem, text, 128);
+            RECT tr = rc;
+            tr.left = x + d + Sx(7);
+            DrawTextW(hdc, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             return TRUE;
         }
         if (dis->CtlType != ODT_LISTBOX) break;
@@ -1488,6 +1629,24 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             break;
         case IDC_RESTORE_BTN:
             RestoreDefaults(hwnd);
+            break;
+        case IDC_RUN_MODE_POLL:
+        case IDC_RUN_MODE_EVENT:
+            // 运行模式改动即时生效（不必等关闭设置窗口）：先写进内存设置，再唤醒监控线程
+            if (HIWORD(wp) == BN_CLICKED) {
+                DWORD mode = (LOWORD(wp) == IDC_RUN_MODE_EVENT) ? kRunModeEvent : kRunModePolling;
+                EnterCriticalSection(&g_settingsLock);
+                g_settings.runMode = mode;
+                LeaveCriticalSection(&g_settingsLock);
+                InvalidateRect(GetDlgItem(g_settingsPage, IDC_RUN_MODE_POLL), NULL, TRUE);
+                InvalidateRect(GetDlgItem(g_settingsPage, IDC_RUN_MODE_EVENT), NULL, TRUE);
+                WakeMonitor();
+                // 扫描间隔只对轮询模式有意义
+                EnableWindow(GetDlgItem(g_settingsPage, IDC_POLL_EDIT), mode == kRunModePolling);
+            }
+            break;
+        case IDC_ABOUT_BTN:
+            ShowAboutDialog(hwnd);
             break;
         case IDC_LAUNCH_REMINDER:
             if (HIWORD(wp) == BN_CLICKED) {
@@ -1582,6 +1741,244 @@ static void OpenSettings() {
         SetForegroundWindow(g_settingsWnd);
         UpdateWindow(g_settingsWnd);
     }
+}
+
+// ---------------------------------------------------------------- 关于窗口
+
+static HWND g_aboutWnd = NULL;
+
+// 关于文案（版本号与 app.rc 的 VERSIONINFO 保持一致）
+static const wchar_t* kAboutText =
+    L"SingleStart 26.11，由HelaRoro开发，使用DeepSeek Flash系列模型，"
+    L"配合Claude Code与DeepSeek Harness进行代码生成。\n\n"
+    L"欢迎大家访问智教联盟论坛！智教联盟论坛是全国最大的电教委在线交流社区，"
+    L"始于 2024，由一群有着远大志向的中学生构建。";
+
+static void ApplyAboutTheme(HWND hwnd) {
+    if (!hwnd) return;
+    bool dark = g_sysDark && g_darkUiReady;
+    ApplyWindowDarkTheme(hwnd, dark);
+    ApplyTitleBarTheme(hwnd, dark);
+    RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
+
+static LRESULT CALLBACK AboutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        if (g_icon) {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)g_icon);
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)g_icon);
+        }
+        NONCLIENTMETRICSW ncm;
+        ncm.cbSize = sizeof(ncm);
+        SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+        HFONT f = CreateFontIndirectW(&ncm.lfMessageFont);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)f); // 字体随窗口销毁
+
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        const int pad    = Sx(16);
+        const int btnH   = Sx(30);
+        const int gap    = Sx(8);
+        const int btnW   = rc.right - pad * 2; // 内容宽度：窗口宽度按它（AI_Used.png 的宽度）确定
+        const int btnNum = 4;
+        const int btnsH  = btnNum * btnH + (btnNum - 1) * gap;
+        int badgeH = btnW / 3; // AI_Used.png 是 3:1
+        if (badgeH < 1) badgeH = 1;
+        int textH = rc.bottom - pad * 2 - btnsH - badgeH - Sx(24);
+        if (textH < Sx(40)) textH = Sx(40);
+
+        HWND text = CreateWindowExW(0, L"STATIC", kAboutText,
+                                    WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+                                    pad, pad, btnW, textH, hwnd,
+                                    (HMENU)IDC_ABOUT_TEXT, g_hInst, NULL);
+        SendMessageW(text, WM_SETFONT, (WPARAM)f, TRUE);
+
+        // 四个按钮各占一行（按钮文案较长，整行宽度才放得下）
+        static const wchar_t* labels[btnNum] = {
+            L"访问HelaRoro的GitHub主页",
+            L"访问HelaRoro的智教联盟论坛主页",
+            L"访问智教联盟论坛",
+            L"关闭"
+        };
+        static const int ids[btnNum] = {
+            IDC_ABOUT_GITHUB, IDC_ABOUT_FORUM_USER, IDC_ABOUT_FORUM, IDC_ABOUT_CLOSE
+        };
+        int y = pad + textH + Sx(12);
+        for (int i = 0; i < btnNum; ++i) {
+            HWND b = CreateWindowExW(0, L"BUTTON", labels[i],
+                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                     pad, y, btnW, btnH, hwnd,
+                                     (HMENU)(INT_PTR)ids[i], g_hInst, NULL);
+            SendMessageW(b, WM_SETFONT, (WPARAM)f, TRUE);
+            y += btnH;
+            if (i + 1 < btnNum) y += gap;
+        }
+
+        // 底部 AI 使用标识：与设置页一致，宽度正好等于内容宽度
+        CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
+                        pad, y + Sx(12), btnW, badgeH, hwnd,
+                        (HMENU)IDC_ABOUT_BADGE, g_hInst, NULL);
+        ApplyAboutTheme(hwnd);
+        return 0;
+    }
+    case WM_ERASEBKGND: {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect((HDC)wp, &rc, g_ui.brPage);
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wp;
+        SetTextColor(hdc, g_ui.text);
+        SetBkColor(hdc, g_ui.pageBg);
+        return (LRESULT)g_ui.brPage;
+    }
+    case WM_CTLCOLORBTN: {
+        HDC hdc = (HDC)wp;
+        SetTextColor(hdc, g_ui.text);
+        SetBkColor(hdc, g_ui.pageBg);
+        return (LRESULT)g_ui.brPage;
+    }
+    case WM_DRAWITEM: {
+        LPDRAWITEMSTRUCT dis = (LPDRAWITEMSTRUCT)lp;
+        if (dis->CtlType == ODT_STATIC && dis->CtlID == IDC_ABOUT_BADGE) {
+            FillRect(dis->hDC, &dis->rcItem, g_ui.brPage);
+            DrawAiBadgeImage(dis->hDC, dis->rcItem);
+            return TRUE;
+        }
+        break;
+    }
+    case WM_SETTINGCHANGE:
+        if (lp && !IsBadStringPtrW((LPCWSTR)lp, 64) &&
+            _wcsicmp((const wchar_t*)lp, L"ImmersiveColorSet") == 0) {
+            bool before = g_sysDark && g_darkUiReady;
+            OnSystemThemeMaybeChanged();
+            if ((g_sysDark && g_darkUiReady) != before) ApplyAboutTheme(hwnd);
+        }
+        return 0;
+    case WM_THEMECHANGED: {
+        // 注意 SetWindowTheme 本身也会发来 WM_THEMECHANGED。只有系统明暗真的变化时才重套主题，
+        // 否则 ApplyAboutTheme -> SetWindowTheme -> WM_THEMECHANGED 会无限递归（界面卡死并崩溃）。
+        bool before = g_sysDark && g_darkUiReady;
+        OnSystemThemeMaybeChanged();
+        if ((g_sysDark && g_darkUiReady) != before) ApplyAboutTheme(hwnd);
+        return 0;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case IDC_ABOUT_GITHUB:
+            ShellExecuteW(hwnd, L"open", L"https://github.com/HelaRoro0625",
+                          NULL, NULL, SW_SHOWNORMAL);
+            break;
+        case IDC_ABOUT_FORUM_USER:
+            ShellExecuteW(hwnd, L"open", L"https://forum.smart-teach.cn/u/HelaRoro",
+                          NULL, NULL, SW_SHOWNORMAL);
+            break;
+        case IDC_ABOUT_FORUM:
+            ShellExecuteW(hwnd, L"open", L"https://forum.smart-teach.cn/",
+                          NULL, NULL, SW_SHOWNORMAL);
+            break;
+        case IDC_ABOUT_CLOSE:
+            DestroyWindow(hwnd);
+            break;
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY: {
+        HWND owner = GetWindow(hwnd, GW_OWNER);
+        g_aboutWnd = NULL;
+        if (owner) { // 解除模态，把焦点还给设置窗口
+            EnableWindow(owner, TRUE);
+            SetForegroundWindow(owner);
+        }
+        return 0;
+    }
+    case WM_NCDESTROY: { // 子控件已全部销毁，此时才能安全删除窗口自己的字体
+        HFONT f = (HFONT)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+        if (f) { DeleteObject(f); SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0); }
+        break;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void ShowAboutDialog(HWND owner) {
+    if (g_aboutWnd) {
+        if (IsIconic(g_aboutWnd)) ShowWindow(g_aboutWnd, SW_RESTORE);
+        ShowWindow(g_aboutWnd, SW_SHOW);
+        SetForegroundWindow(g_aboutWnd);
+        return;
+    }
+    static bool clsRegistered = false;
+    if (!clsRegistered) {
+        WNDCLASSEXW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = AboutProc;
+        wc.hInstance = g_hInst;
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = NULL; // 底色由 WM_ERASEBKGND 按当前明暗填充
+        wc.lpszClassName = kAboutClass;
+        RegisterClassExW(&wc);
+        clsRegistered = true;
+    }
+    // 窗口宽度刚好容纳 AI_Used.png（内容宽度与设置页一致），高度按正文实测值计算，
+    // 避免不同 DPI/字体下正文被裁剪。
+    const int pad      = Sx(16);
+    const int contentW = Sx(kPageCtlW);
+    const int btnH     = Sx(30);
+    const int gap      = Sx(8);
+    const int btnsH    = 4 * btnH + 3 * gap;
+    const int badgeH   = contentW / 3;
+    int textH = Sx(120);
+    {
+        NONCLIENTMETRICSW ncm;
+        ncm.cbSize = sizeof(ncm);
+        SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+        HFONT f = CreateFontIndirectW(&ncm.lfMessageFont);
+        HDC dc = GetDC(NULL);
+        if (dc && f) {
+            HFONT old = (HFONT)SelectObject(dc, f);
+            RECT tr = { 0, 0, contentW, 0 };
+            DrawTextW(dc, kAboutText, -1, &tr, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+            SelectObject(dc, old);
+            textH = tr.bottom - tr.top;
+        }
+        if (dc) ReleaseDC(NULL, dc);
+        if (f) DeleteObject(f);
+    }
+    textH += Sx(8); // GDI 与 STATIC 的换行细节可能差一点，留出余量
+    if (textH < Sx(40)) textH = Sx(40);
+
+    RECT cr = { 0, 0, contentW + pad * 2,
+                pad + textH + Sx(12) + btnsH + Sx(12) + badgeH + pad };
+    const DWORD style   = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    const DWORD exStyle = WS_EX_TOOLWINDOW;
+    AdjustWindowRectEx(&cr, style, FALSE, exStyle);
+    const int w = cr.right - cr.left;
+    const int h = cr.bottom - cr.top;
+
+    int x = 0, y = 0;
+    RECT orc;
+    if (owner && GetWindowRect(owner, &orc)) {
+        x = orc.left + ((orc.right - orc.left) - w) / 2;
+        y = orc.top + ((orc.bottom - orc.top) - h) / 2;
+    } else {
+        RECT wa = { 0, 0, 0, 0 };
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+        x = wa.left + ((wa.right - wa.left) - w) / 2;
+        y = wa.top + ((wa.bottom - wa.top) - h) / 2;
+    }
+    g_aboutWnd = CreateWindowExW(exStyle, kAboutClass, L"关于 SingleStart",
+                                 style, x, y, w, h, owner, NULL, g_hInst, NULL);
+    if (!g_aboutWnd) return;
+    if (owner) EnableWindow(owner, FALSE); // 模态：关于窗口关闭前禁用设置窗口
+    ShowWindow(g_aboutWnd, SW_SHOW);
+    SetForegroundWindow(g_aboutWnd);
+    UpdateWindow(g_aboutWnd);
 }
 
 // ---------------------------------------------------------------- 白名单列表（子类）
@@ -2700,13 +3097,37 @@ static void ShowReminder(DWORD pid, const std::wstring& text, const std::wstring
     AnimClockArm(); // 交给动画时钟按 ~16ms 推进（弹出/覆盖/渐隐都在里面）
 }
 
-// 低层鼠标钩子：记录最近一次左键点击（供覆盖层第①级定位）
+// 点击是否落在可能拉起新程序的位置（任务栏 / 桌面 / 开始菜单或搜索 / 资源管理器）。
+// 只认这几类顶层窗口的类名，避免在普通应用里每点一下都触发额外的进程扫描。
+static bool IsLaunchClick(POINT pt) {
+    HWND h = WindowFromPoint(pt);
+    if (!h) return false;
+    HWND root = GetAncestor(h, GA_ROOT);
+    if (!root) root = h;
+    wchar_t cls[64] = { 0 };
+    if (!GetClassNameW(root, cls, 64)) return false;
+    return _wcsicmp(cls, L"Shell_TrayWnd") == 0 ||                // 任务栏（含应用按钮）
+           _wcsicmp(cls, L"Progman") == 0 ||                     // 桌面
+           _wcsicmp(cls, L"WorkerW") == 0 ||                     // 桌面（图标/壁纸宿主）
+           _wcsicmp(cls, L"CabinetWClass") == 0 ||               // 文件资源管理器
+           _wcsicmp(cls, L"Windows.UI.Core.CoreWindow") == 0 ||  // 开始菜单/搜索/UWP
+           _wcsicmp(cls, L"XamlExplorerHostIslandWindow") == 0;  // Win11 开始菜单/搜索
+}
+
+// 低层鼠标钩子：记录最近一次左键点击（供覆盖层第①级定位）。
+// 另外，若点击可能拉起新程序，就唤醒轮询循环并进入 2 秒的快速扫描期——
+// 这样即使扫描间隔设得较大（如 500ms），也能抓住“启动即退出”的第二实例；
+// 空闲时没有点击，仍完全按用户设置的间隔扫描。
 static LRESULT CALLBACK MouseHookProc(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION && wp == WM_LBUTTONDOWN) {
         MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lp;
         g_lastClick = ms->pt;
         g_lastClickTick = GetTickCount64();
         g_hasClick = true;
+        if (IsLaunchClick(ms->pt)) {
+            g_shellClickTick = GetTickCount();
+            if (g_monitorWake) SetEvent(g_monitorWake);
+        }
     }
     return CallNextHookEx(NULL, code, wp, lp);
 }
@@ -2854,26 +3275,152 @@ static bool IsExempt(const std::wstring& exeName) {
     return inWl;
 }
 
-// 监控线程：周期性扫描进程，拦截"短时间内的重复启动"
-static DWORD WINAPI MonitorThread(LPVOID) {
+// ---------------------------------------------------------------- 进程监控
+// 两种运行模式（设置里可切换，默认轮询）：
+//  - 轮询：每 pollIntervalMs 抓一次进程快照。能捕捉“启动后很快退出”的存根，兼容性最好，
+//    但空闲时也会周期性扫描；
+//  - 窗口事件（实验性）：用 SetWinEventHook 监听顶层窗口的创建/显示事件，空闲时不占 CPU。
+//    拿不到完全不创建窗口的进程；UWP 的窗口属于 ApplicationFrameHost，需要反查子窗口。
+// 两种模式共用同一套“启动提醒 + 重复启动拦截”逻辑（HandleNewProcess）。
+
+static DWORD g_monitorThreadId = 0;
+// 最近一次启动时刻（去重键 -> tick）。只在监控线程里访问，无需加锁。
+static std::map<std::wstring, ULONGLONG> g_launchTimes;
+// 窗口事件模式已处理过的进程（pid -> 进程创建时间）：用于忽略同一进程后续创建的窗口；
+// 创建时间不同说明 pid 被复用，按新启动处理。
+static std::map<DWORD, ULONGLONG> g_seenEventPids;
+static ULONGLONG g_eventStartFt = 0; // 开始监听窗口事件的时刻（FILETIME），之前就存在的进程一律忽略
+
+// 唤醒监控线程：轮询模式靠事件，窗口事件模式靠线程消息
+static void WakeMonitor() {
+    InterlockedExchange(&g_eventModeFailed, 0); // 允许重新尝试窗口事件
+    if (g_monitorWake) SetEvent(g_monitorWake);
+    if (g_monitorThreadId) PostThreadMessageW(g_monitorThreadId, WM_MONITOR_SWITCH, 0, 0);
+}
+
+static ULONGLONG FileTimeToU64(const FILETIME& ft) {
+    return ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+}
+
+// 取进程路径与创建时间（FILETIME 数值）。失败返回 false。
+static bool QueryProcPathAndTime(DWORD pid, std::wstring& path, ULONGLONG& createFt) {
+    path.clear();
+    createFt = 0;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    wchar_t buf[MAX_PATH];
+    DWORD sz = MAX_PATH;
+    bool ok = QueryFullProcessImageNameW(h, 0, buf, &sz) != 0;
+    FILETIME ct = { 0, 0 }, et = { 0, 0 }, kt = { 0, 0 }, ut = { 0, 0 };
+    if (ok && GetProcessTimes(h, &ct, &et, &kt, &ut)) createFt = FileTimeToU64(ct);
+    if (ok) path.assign(buf, sz);
+    CloseHandle(h);
+    return ok;
+}
+
+// 目标 pid 的父进程是否为 explorer.exe / ApplicationFrameHost.exe（即“由用户点击图标拉起”）
+static bool IsUserLaunched(DWORD pid) {
+    std::map<DWORD, ProcEntry> snap = EnumProcs();
+    auto it = snap.find(pid);
+    if (it == snap.end()) return false;
+    auto pit = snap.find(it->second.parentPid);
+    if (pit == snap.end()) return false;
+    std::wstring p = Lower(pit->second.exe);
+    return p == L"explorer.exe" || p == L"applicationframehost.exe";
+}
+
+// 是否还有同名实例存活（强保证“至少留一个”）。cur 为空时现抓一次快照（窗口事件模式用）。
+static bool HasOtherInstance(const std::wstring& exeLower, DWORD excludePid,
+                             const std::map<DWORD, ProcEntry>* cur) {
+    if (cur) {
+        for (auto& k2 : *cur)
+            if (k2.first != excludePid && Lower(k2.second.exe) == exeLower) return true;
+        return false;
+    }
+    std::map<DWORD, ProcEntry> snap = EnumProcs();
+    for (auto& k2 : snap)
+        if (k2.first != excludePid && Lower(k2.second.exe) == exeLower) return true;
+    return false;
+}
+
+// 一次“用户启动了一个程序”的公共处理：发启动提醒，并判断是否重复启动。
+static void HandleNewProcess(DWORD pid, const std::wstring& exe,
+                             const std::wstring& fullPath,
+                             const std::map<DWORD, ProcEntry>* cur) {
+    ULONGLONG now = GetTickCount64();
+    bool blockDup, blockNotify, remind;
+    EnterCriticalSection(&g_settingsLock);
+    blockDup    = g_settings.blockDup;
+    blockNotify = g_settings.blockNotify;
+    remind      = g_settings.launchReminder;
+    LeaveCriticalSection(&g_settingsLock);
+    DWORD dupWindow = GetDupWindowMs();
+
+    // 启动提醒：只要检测到软件被用户拉起就提醒（无论是否重复 / 是否被拦截）。
+    // 白名单在调用前已排除。
+    if (remind)
+        PostMessageW(g_trayWnd, WM_REMINDER, 0, (LPARAM)new LaunchEvent{ pid, fullPath, exe });
+
+    // 去重键优先用全路径：不同目录下的同名程序（各自的 setup.exe / Launcher.exe）
+    // 不是彼此的“第二实例”，不应互相拦截；取不到路径时退回文件名。
+    std::wstring exeLower = Lower(exe);
+    std::wstring key = fullPath.empty() ? exeLower : Lower(fullPath);
+    auto it = g_launchTimes.find(key);
+    ULONGLONG last = (it != g_launchTimes.end()) ? it->second : 0;
+
+    if (last != 0 && (now - last) <= dupWindow) {
+        // 强保证“至少一个存活”：杀新进程前先确认还有同名实例在运行。
+        // 若原实例已退出（关闭窗口 / 崩溃 / 存根已转交），则放行本次启动，
+        // 让它成为存活的实例，避免“拦截后一个都不剩”。
+        if (HasOtherInstance(exeLower, pid, cur) && blockDup) {
+            // 判定为连点造成的重复启动：结束新进程（是否弹气泡由 blockNotify 另行决定）
+            HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+            BOOL killed = FALSE;
+            if (h) {
+                killed = TerminateProcess(h, 1);
+                CloseHandle(h);
+            }
+            if (killed && blockNotify)
+                PostMessageW(g_trayWnd, WM_BLOCKED, 0,
+                             (LPARAM)new LaunchEvent{ pid, fullPath, exe });
+        }
+        g_launchTimes[key] = now; // 刷新时间，判定窗口内连续第 3 次点击也能拦住
+    } else {
+        g_launchTimes[key] = now;
+    }
+}
+
+// 清理过期的启动记录（保留 2 倍窗口，给“启动即退出”的存根留出识别余地）
+static void PruneLaunchTimes(ULONGLONG now, DWORD dupWindow) {
+    for (auto it = g_launchTimes.begin(); it != g_launchTimes.end();) {
+        if (now - it->second > (ULONGLONG)dupWindow * 2) it = g_launchTimes.erase(it);
+        else ++it;
+    }
+}
+
+// ---- 轮询模式
+
+static void RunPollingMonitor() {
     // 先取一次基准快照：否则第一次扫描时 prev 为空，本软件启动前就在运行的所有进程
     // 都会被当成“刚启动”——既会误杀同名的既有实例（如已开着的两个记事本），
     // 也会在每个同类进程上弹一条启动提醒。
     std::map<DWORD, ProcEntry> prev = EnumProcs();
-    // “最近一次由用户点击图标启动”的时刻。进程退出后仍保留一段时间，
-    // 让 calc.exe 这类“启动即退出、转交真程序”的存根也能被识别为重复启动。
-    std::map<std::wstring, ULONGLONG> lastLaunch;
 
     for (;;) {
-        Sleep(GetPollIntervalMs());
+        // 用可等待事件代替 Sleep：切换运行模式/改扫描间隔时能立刻醒来，不必等满一个周期
+        DWORD waitMs = GetPollIntervalMs();
+        // 刚在任务栏/桌面/开始菜单/资源管理器点过：2 秒内临时按 100ms 扫描，
+        // 抓住“启动即退出”的存根。没有点击时不提高频率，空闲 CPU 占用不变。
+        DWORD now32 = GetTickCount();
+        if (g_shellClickTick != 0 && now32 - g_shellClickTick < 2000 && waitMs > 100)
+            waitMs = 100;
+        if (g_monitorWake) WaitForSingleObject(g_monitorWake, waitMs);
+        else Sleep(waitMs);
+        if (GetRunMode() != kRunModePolling) return; // 切换到了窗口事件模式
+
         ULONGLONG now = GetTickCount64();
         auto cur = EnumProcs();
         if (cur.empty()) continue; // 快照失败：跳过本轮且不更新基准，否则下一轮会把所有进程当成新启动
-        EnterCriticalSection(&g_settingsLock);
-        bool blockDup    = g_settings.blockDup;    // 拦截重复启动开关（false 时不杀第二实例）
-        bool blockNotify = g_settings.blockNotify; // 拦截到重复启动时气泡通知开关
-        DWORD dupWindow  = g_settings.dupWindowMs; // 重复启动判定时间窗口（毫秒，设置里可调）
-        LeaveCriticalSection(&g_settingsLock);
 
         for (auto& kv : cur) {
             DWORD pid = kv.first;
@@ -2903,54 +3450,133 @@ static DWORD WINAPI MonitorThread(LPVOID) {
                 }
             }
 
-            // 启动提醒：只要检测到软件被用户拉起就提醒（无论是否重复 / 是否被拦截）。
-            // 白名单在前面 IsExempt 时已排除。
-            EnterCriticalSection(&g_settingsLock);
-            bool remind = g_settings.launchReminder;
-            LeaveCriticalSection(&g_settingsLock);
-            if (remind)
-                PostMessageW(g_trayWnd, WM_REMINDER, 0,
-                             (LPARAM)new LaunchEvent{ pid, fullPath, exe });
-
-            // 去重键优先用全路径：不同目录下的同名程序（各自的 setup.exe / Launcher.exe）
-            // 不是彼此的“第二实例”，不应互相拦截；取不到路径时退回文件名。
-            std::wstring exeLower = Lower(exe);
-            std::wstring key = fullPath.empty() ? exeLower : Lower(fullPath);
-            auto it = lastLaunch.find(key);
-            ULONGLONG last = (it != lastLaunch.end()) ? it->second : 0;
-
-            if (last != 0 && (now - last) <= dupWindow) {
-                // 强保证"至少一个存活"：杀新进程前先确认还有同名实例在运行。
-                // 若原实例已退出（关闭窗口 / 崩溃 / 存根已转交），则放行本次启动，
-                // 让它成为存活的实例，避免"拦截后一个都不剩"。
-                bool survivor = false;
-                for (auto& k2 : cur) {
-                    if (k2.first != pid && Lower(k2.second.exe) == exeLower) { survivor = true; break; }
-                }
-                if (survivor && blockDup) {
-                    // 判定为连点造成的重复启动：结束新进程（是否弹气泡由 blockNotify 另行决定）
-                    HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-                    BOOL killed = FALSE;
-                    if (h) {
-                        killed = TerminateProcess(h, 1);
-                        CloseHandle(h);
-                    }
-                    if (killed && blockNotify)
-                        PostMessageW(g_trayWnd, WM_BLOCKED, 0,
-                                     (LPARAM)new LaunchEvent{ pid, fullPath, exe });
-                }
-                lastLaunch[key] = now; // 刷新时间，2 秒内连续第 3 次点击也能拦住
-            } else {
-                lastLaunch[key] = now;
-            }
+            HandleNewProcess(pid, exe, fullPath, &cur);
         }
 
-        // 清理过期的启动记录（保留 2 倍窗口，给“启动即退出”的存根留出识别余地）
-        for (auto it = lastLaunch.begin(); it != lastLaunch.end();) {
-            if (now - it->second > (ULONGLONG)dupWindow * 2) it = lastLaunch.erase(it);
-            else ++it;
-        }
+        PruneLaunchTimes(now, GetDupWindowMs());
         prev = cur;
+    }
+}
+
+// ---- 窗口事件模式（实验性）
+// 关心“顶层窗口第一次创建/显示”：CREATE 在 CreateWindowEx 期间就会到达，此时窗口尚未显示，
+// 因此启动提醒能在目标窗口出现之前弹出；SHOW 作为兜底（个别程序可能不发 CREATE）。
+// 用进程创建时间与开始监听时刻比较，避免把监听开始前就存在的程序（以及它后来弹出的
+// 菜单/提示框）误判成新启动；同一进程后续再创建窗口由 g_seenEventPids 忽略。
+
+// UWP 窗口的顶层窗口属于 ApplicationFrameHost，真正的应用进程是它的子窗口
+// （通常是 Windows.UI.Core.CoreWindow）。优先按类名找，找不到再退回“PID 不同的子窗口”。
+struct UwpFindCtx { DWORD hostPid; DWORD appPid; DWORD anyPid; };
+static BOOL CALLBACK FindUwpChildCB(HWND h, LPARAM lp) {
+    UwpFindCtx* c = (UwpFindCtx*)lp;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (!pid || pid == c->hostPid) return TRUE;
+    wchar_t cls[64] = { 0 };
+    GetClassNameW(h, cls, 64);
+    if (_wcsicmp(cls, L"Windows.UI.Core.CoreWindow") == 0) {
+        c->appPid = pid;
+        return FALSE; // 找到了，停止枚举
+    }
+    if (!c->anyPid) c->anyPid = pid;
+    return TRUE;
+}
+static DWORD FindUwpAppPid(HWND frame, DWORD hostPid) {
+    UwpFindCtx c = { hostPid, 0, 0 };
+    EnumChildWindows(frame, FindUwpChildCB, (LPARAM)&c);
+    return c.appPid ? c.appPid : c.anyPid;
+}
+
+static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
+                                  LONG idObject, LONG idChild, DWORD, DWORD) {
+    // CREATE 在窗口创建时到达（此时还没显示），SHOW 兜底：
+    // 这样点击软件后、目标窗口显示之前就能弹出提醒。
+    if ((event != EVENT_OBJECT_CREATE && event != EVENT_OBJECT_SHOW) ||
+        idObject != OBJID_WINDOW || idChild != CHILDID_SELF)
+        return;
+    if (!hwnd || !IsWindow(hwnd)) return;
+    if (GetAncestor(hwnd, GA_ROOT) != hwnd) return; // 只要顶层窗口（过滤各级子控件）
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!pid || pid == GetCurrentProcessId()) return;
+
+    std::wstring path;
+    ULONGLONG createFt = 0;
+    if (!QueryProcPathAndTime(pid, path, createFt)) return;
+    std::wstring exe = GetFileName(path);
+
+    // 有些系统版本会把 UWP 的 CoreWindow 作为顶层窗口直接显示（不套框架窗口），
+    // 这种窗口的类名即可确认是 UWP 应用，不再要求父进程是 explorer。
+    wchar_t cls[64] = { 0 };
+    GetClassNameW(hwnd, cls, 64);
+    bool uwpWindow = _wcsicmp(cls, L"Windows.UI.Core.CoreWindow") == 0;
+
+    bool fromUwp = false;
+    if (_wcsicmp(exe.c_str(), L"ApplicationFrameHost.exe") == 0) {
+        // UWP：框架窗口属于 ApplicationFrameHost，反查真正的应用进程
+        DWORD appPid = FindUwpAppPid(hwnd, pid);
+        if (!appPid || appPid == GetCurrentProcessId()) return; // 查不到就忽略该事件
+        pid = appPid;
+        if (!QueryProcPathAndTime(pid, path, createFt)) return;
+        exe = GetFileName(path);
+        fromUwp = true;
+    }
+
+    // 监听开始前就已存在的进程（含它后来弹出的菜单/提示框）不是“软件启动”
+    if (createFt == 0 || createFt < g_eventStartFt) return;
+
+    auto sit = g_seenEventPids.find(pid);
+    if (sit != g_seenEventPids.end() && sit->second == createFt) return; // 同一进程的后续窗口
+    g_seenEventPids[pid] = createFt;
+
+    if (IsExempt(exe)) return;
+    // UWP 应用已由可见的框架窗口/CoreWindow 确认是用户界面，不再要求父进程是 explorer
+    if (!fromUwp && !uwpWindow && !IsUserLaunched(pid)) return;
+
+    HandleNewProcess(pid, exe, path, NULL);
+    PruneLaunchTimes(GetTickCount64(), GetDupWindowMs());
+}
+
+// 进入窗口事件模式，直到运行模式改回轮询（返回 true）或钩子创建失败（返回 false）
+static bool RunEventMonitor() {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    g_eventStartFt = FileTimeToU64(ft);
+
+    HWINEVENTHOOK hook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, NULL,
+                                         WinEventProc, 0, 0,
+                                         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (!hook) return false;
+
+    MSG msg;
+    for (;;) {
+        BOOL r = GetMessageW(&msg, NULL, 0, 0);
+        if (r == 0 || r == -1) break; // WM_QUIT / 出错
+        if (msg.message == WM_MONITOR_SWITCH) {
+            if (GetRunMode() != kRunModeEvent) break; // 切回轮询
+            continue; // 其它设置变化：继续监听
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    UnhookWinEvent(hook);
+    return true;
+}
+
+// 监控线程：按当前运行模式运行；切换模式时退出当前循环，进入另一种模式
+static DWORD WINAPI MonitorThread(LPVOID) {
+    g_monitorThreadId = GetCurrentThreadId();
+    for (;;) {
+        if (GetRunMode() == kRunModeEvent) {
+            if (!RunEventMonitor()) {
+                // 钩子创建失败（极少见）：本会话退回轮询，避免监控完全失效。
+                // 用户重新选择运行模式时会清掉该标记并再试一次。
+                InterlockedExchange(&g_eventModeFailed, 1);
+            }
+        } else {
+            RunPollingMonitor();
+        }
     }
     return 0;
 }
@@ -2979,6 +3605,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         Gdiplus::GdiplusStartupInput gdipInput;
         Gdiplus::GdiplusStartup(&gdipToken, &gdipInput, NULL);
     }
+    g_aiBadge = LoadPngResource(IDR_AI_BADGE); // 设置页底部标识（资源缺失时留空，不影响其它功能）
 
     // 启用 ComCtl32 v6 视觉样式（现代按钮/编辑框外观；需配合 app.manifest 声明 v6 依赖）
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES };
@@ -3030,6 +3657,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     // 启动时通知：软件自身启动完成后弹气泡
     if (g_settings.startupNotify) PostMessageW(g_trayWnd, WM_SHOW_STARTUP, 0, 0);
 
+    // 监控线程的唤醒事件（自动复位）：切换运行模式时立即生效，不必等满一个轮询周期
+    g_monitorWake = CreateEventW(NULL, FALSE, FALSE, NULL);
+
     HANDLE hThread = CreateThread(NULL, 0, MonitorThread, NULL, 0, NULL);
     if (!hThread) {
         ShowStartupError(L"创建监控线程失败");
@@ -3074,10 +3704,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
 
     RemoveTrayIcon();
     if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
+    if (g_monitorWake) { CloseHandle(g_monitorWake); g_monitorWake = NULL; }
     if (g_animTimer) { CancelWaitableTimer(g_animTimer); CloseHandle(g_animTimer); g_animTimer = NULL; }
     CloseHandle(hMutex);
     if (g_settingsPage) SaveSettings(); // 设置窗口还开着时，退出前把改动落盘
     if (g_settingsWnd) DestroyWindow(g_settingsWnd);
+    if (g_aiBadge) { delete g_aiBadge; g_aiBadge = NULL; }
     if (gdipToken) Gdiplus::GdiplusShutdown(gdipToken);
     return exitCode;
 }
